@@ -1,0 +1,30 @@
+[package]
+name        = "parda-protocol"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+description = "PARDA cryptographic protocol layer — libsignal-protocol wrapper"
+
+# ─── Signal Foundation's Rust implementation of the Signal Protocol.
+# Pin the tag to a specific audited release; never float this dependency.
+# Build requirements: Rust ≥ 1.75, clang/LLVM, MSVC on Windows.
+[dependencies]
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.66.0", package = "libsignal-protocol" }
+
+async-trait = { workspace = true }
+base64      = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+uuid        = { workspace = true }
+zeroize     = { workspace = true }
+rand        = "0.8"
+
+[dev-dependencies]
+tokio       = { workspace = true, features = ["full"] }
+tokio-test  = "0.4"
+
+[[test]]
+name    = "crypto_tests"
+path    = "tests/crypto_tests.rs"
