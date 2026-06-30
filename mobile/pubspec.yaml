@@ -1,0 +1,50 @@
+name: parda_mobile
+description: PARDA — Privacy-Assured Resilient Defense Architecture mobile client
+version: 0.1.0+1
+publish_to: none
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # HTTP client for relay server communication
+  http: ^1.2.1
+
+  # Secure key-value storage (delegates to Android Keystore / iOS Keychain)
+  flutter_secure_storage: ^9.0.0
+
+  # State management
+  provider: ^6.1.2
+
+  # UUID generation for message IDs
+  uuid: ^4.4.0
+
+  # JSON serialisation
+  json_annotation: ^4.9.0
+
+  # Local SQLite message store
+  sqflite: ^2.3.3
+  path: ^1.9.0
+
+  # Timestamps & formatting
+  intl: ^0.19.0
+
+  # Connectivity detection
+  connectivity_plus: ^6.0.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  build_runner: ^2.4.9
+  json_serializable: ^6.8.0
+  mockito: ^5.4.4
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/
