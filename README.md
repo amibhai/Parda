@@ -115,16 +115,47 @@ Each phase produces independently testable deliverables. Phases 1–3 target sta
 
 > ⚠️ **RESEARCH PROTOTYPE — NOT FOR OPERATIONAL DEPLOYMENT**
 
-PARDA is currently in the **initial scaffolding phase**. The following limitations apply and must be understood before any evaluation:
+**Current phase: Phase 1 — Core E2EE Messaging (in development)**
+
+PARDA Phase 1 delivers a working 1:1 end-to-end encrypted messenger using the Signal Protocol. The following properties **are** provided in Phase 1:
+
+| Property | Status |
+|----------|--------|
+| Message confidentiality (Signal Protocol X3DH + Double Ratchet) | ✅ Phase 1 |
+| Forward secrecy (per-message ephemeral keys) | ✅ Phase 1 |
+| Break-in recovery (Double Ratchet self-healing) | ✅ Phase 1 |
+| Hardware-backed key storage (Android Keystore / iOS Secure Enclave) | ✅ Phase 1 |
+| Cryptographic self-destruct | 🔲 Phase 3 |
+| Sender-receiver unlinkability / sealed sender | 🔲 Phase 2 |
+| Mix-network metadata resistance | 🔲 Phase 2 |
+| Offline mesh dead-drop | 🔲 Phase 4 |
+| Post-quantum key encapsulation (ML-KEM) | 🔲 Phase 5 |
+
+The following limitations apply and must be understood before any evaluation:
 
 - **No CNSA 2.0 compliance.** Post-quantum algorithms (ML-KEM, ML-DSA, SLH-DSA) are not yet integrated. The current design uses classical elliptic-curve primitives only.
 - **No FIPS 140-3 validation.** Cryptographic modules have not undergone formal FIPS certification.
 - **No formal security audit.** The codebase has not been independently audited by a third-party cryptographic firm.
 - **Not accredited for classified networks.** PARDA has no ATO (Authority to Operate), does not comply with RMF/DIACAP, and must not be used on any classified infrastructure.
+- **Relay server sees sender → recipient metadata in Phase 1.** Sealed-sender envelopes are a Phase 2 deliverable.
+- **In-memory relay store.** Messages are lost on server restart. Persistent storage arrives in Phase 2.
+- **No TLS in server binary.** Use a reverse proxy (nginx/Caddy) with a valid certificate in any networked deployment.
 - **Side-channel mitigations are partial.** Constant-time implementations are targeted but not yet verified across all code paths.
-- **Mix-network anonymity guarantees are theoretical.** Formal anonymity proofs and adversarial simulations are planned but not yet complete.
 
 This project is published for research, academic review, and engineering demonstration purposes only.
+
+---
+
+## Phase 1 Components
+
+| Directory | Description |
+|-----------|-------------|
+| [`/protocol`](protocol/) | Rust: libsignal-protocol wrapper (X3DH, Double Ratchet, key gen) |
+| [`/server`](server/) | Rust/Axum: dumb-pipe relay server (store-and-forward) |
+| [`/mobile`](mobile/) | Flutter: cross-platform client with Android Keystore integration |
+| [`/docs`](docs/) | Architecture decisions, threat model |
+
+See [`docs/phase1-architecture.md`](docs/phase1-architecture.md) for stack decisions and tradeoffs.
 
 ---
 
