@@ -1,35 +1,65 @@
 # Rust
 target/
-Cargo.lock
+# NOTE: Cargo.lock is intentionally committed for binary crates (server).
+# Do NOT add Cargo.lock here.
 
 # Flutter / Dart
 .dart_tool/
 .flutter-plugins
 .flutter-plugins-dependencies
-build/
 *.g.dart
+*.freezed.dart
 
-# Environment & Secrets
+# Flutter build outputs
+mobile/build/
+mobile/.dart_tool/
+
+# Android build
+mobile/android/.gradle/
+mobile/android/app/build/
+mobile/android/local.properties
+mobile/android/key.properties        # signing keystore config — never commit
+
+# iOS build
+mobile/ios/build/
+mobile/ios/Pods/
+mobile/ios/.symlinks/
+mobile/ios/Flutter/Generated.xcconfig
+mobile/ios/Flutter/flutter_export_environment.sh
+
+# Environment & secrets
 .env
+.env.*
 *.pem
 *.key
 *.p12
+*.jks                                # Android signing keystore
+
+# Local relay data (dev only)
+relay-data/
+*.db
+*.sqlite
+*.sqlite3
 
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # IDE
 .vscode/
 .idea/
 *.iml
+*.swp
 
 # Docker
 docker-compose.override.yml
 
-# Logs
+# Logs & crash dumps
 *.log
 logs/
+crash-*.txt
 
 # Test artifacts
 coverage/
+lcov.info
