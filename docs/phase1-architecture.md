@@ -2,6 +2,7 @@
 
 **Status:** Accepted  
 **Date:** 2026-06-30  
+**Last reviewed:** 2026-07-01  
 **Phase:** 1 — Core End-to-End Encrypted Messaging  
 **Author:** PARDA Engineering
 
@@ -270,3 +271,8 @@ flutter doctor                 # verify dependencies
    building on Windows requires MSVC and correct PATH configuration.
 5. **libsignal git dependency:** Floating the dependency (no pinned tag) risks
    upstream API breaks. `Cargo.lock` must be committed.
+6. **One-time prekey exhaustion:** If Alice sends many sessions before Bob
+   replenishes his one-time prekey pool, the relay returns bundles without a
+   one-time prekey. This is safe per the X3DH spec but slightly weakens
+   forward secrecy for that session. Phase 2 will add automatic pool
+   replenishment logic to `SessionService`.

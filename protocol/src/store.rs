@@ -43,7 +43,12 @@ impl<T> PardaKeyStore for T where
 /// Suitable for unit tests and local integration tests.
 /// **Not suitable for production use** — all key material is plaintext in RAM
 /// and is lost when the process exits.
-#[derive(Default)]
+///
+/// For production, replace this with a store that:
+/// - Persists session records to SQLCipher (encrypted SQLite)
+/// - Wraps identity key operations through the platform keystore
+/// - Implements the same four traits so `SessionManager` needs no changes
+#[derive(Default)] // Default yields an uninitialised store; call ::new() instead
 pub struct InMemorySignalProtocolStore {
     /// Local identity key pair.
     identity_key_pair: Option<IdentityKeyPair>,
@@ -203,7 +208,10 @@ impl IdentityKeyStore for InMemorySignalProtocolStore {
         _direction: Direction,
     ) -> Result<bool, SignalProtocolError> {
         // Trust-On-First-Use (TOFU) — Phase 1 default.
-        // Phase 2 adds out-of-band safety number verification.
+        // Phase 2 upgrades this to explicit safety-number verification:
+        // the user compares a fingerprint of identity keys out-of-band
+        // (similar to Signal's "safety number" screen) before marking
+        // a remote identity as permanently trusted.
         Ok(self
             .trusted_identities
             .get(&address.to_string())
