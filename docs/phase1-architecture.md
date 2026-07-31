@@ -220,6 +220,13 @@ rustup target add aarch64-linux-android   # if building for Android
 # Windows: MSVC Build Tools 2022 required (not MinGW)
 ```
 
+**Additional prerequisites as of Sub-Phase 2A (§11):**
+- `protoc` (Protocol Buffers compiler) — required by `libsignal-protocol`'s
+  build script. `apt install protobuf-compiler` / `choco install protoc` /
+  download from the [protobuf releases page](https://github.com/protocolbuffers/protobuf/releases).
+- A complete Perl — required by `parda-relay`'s vendored SQLCipher/OpenSSL
+  build. See §11 for the Windows-specific gotcha and fix.
+
 ### Flutter (mobile)
 
 ```bash
@@ -276,3 +283,44 @@ flutter doctor                 # verify dependencies
    one-time prekey. This is safe per the X3DH spec but slightly weakens
    forward secrecy for that session. Phase 2 will add automatic pool
    replenishment logic to `SessionService`.
+
+---
+
+## 11. Sub-Phase 2A Addendum (Sealed Sender + Persistence)
+
+**Status:** Accepted | **Date:** 2026-07-31
+
+This ADR predates Sub-Phase 2A; the decisions below extend it rather than
+revise the sections above (§1-10 remain an accurate record of what was
+decided for Phase 1). Risks #1 and #2 in §10 are resolved as described here;
+risk #3 is unchanged (sealed sender authenticates senders to recipients, not
+clients to the relay — see `docs/THREAT_MODEL.md` §3.5).
+
+**Sealed sender:** implemented by calling `libsignal-protocol`'s own
+`sealed_sender_encrypt`/`sealed_sender_decrypt` and `SenderCertificate`/
+`ServerCertificate` types directly (already vendored in the pinned
+`v0.66.0` tag) rather than assembling anything from primitives — consistent
+with the no-custom-crypto constraint in §2. `parda-relay` hosts the
+certificate authority, at the same Trust-On-First-Use trust level Phase 1
+already accepted for prekey bundle uploads (no new trust assumption
+introduced, an existing one extended).
+
+**Relay persistence:** `rusqlite` with the `bundled-sqlcipher-vendored-openssl`
+feature — compiles SQLCipher and OpenSSL from source, so no system SQLCipher
+or OpenSSL install is required on the build machine. This carries one real
+build prerequisite worth flagging explicitly: **a complete, working Perl**
+(OpenSSL's `Configure` step needs it). On Linux/macOS this is normally a
+non-issue. On Windows, the Perl bundled with some Git-for-Windows /
+lightweight MSYS installs is missing CPAN modules OpenSSL's `Configure`
+needs (`Locale::Maketext::Simple` was the specific gap hit during Sub-Phase
+2A development) — install
+[Strawberry Perl](https://strawberryperl.com) (portable ZIP is sufficient)
+and ensure it's on `PATH` ahead of any other `perl`. GitHub Actions'
+`windows-latest` runner ships a working Perl already, so CI is unaffected;
+this is a local Windows dev-machine setup note only. Added to §8 build
+prerequisites below.
+
+**Envelope versioning:** added ahead of any further wire-format changes
+(§9's Sphinx routing-hint work in Sub-Phase 2B will be the next one), per
+the explicit requirement that version mismatches fail loud rather than
+silently misinterpret bytes.

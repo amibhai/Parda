@@ -115,19 +115,23 @@ Each phase produces independently testable deliverables. Phases 1–3 target sta
 
 > ⚠️ **RESEARCH PROTOTYPE — NOT FOR OPERATIONAL DEPLOYMENT**
 
-**Current phase: Phase 1 — Core E2EE Messaging (in development)**
+**Current phase: Phase 2, Sub-Phase 2A complete (Sealed Sender + persistence) — Sub-Phase 2B (mix-network routing) not yet started**
 
-PARDA Phase 1 delivers a working 1:1 end-to-end encrypted messenger using the Signal Protocol. The following properties **are** provided in Phase 1:
+Every ✅ below is backed by a named test — see `docs/THREAT_MODEL.md` §5 for the exact test each row cites. A property is never marked done on the strength of the implementation alone.
 
 | Property | Status |
 |----------|--------|
 | Message confidentiality (Signal Protocol X3DH + Double Ratchet) | ✅ Phase 1 |
 | Forward secrecy (per-message ephemeral keys) | ✅ Phase 1 |
-| Break-in recovery (Double Ratchet self-healing) | ✅ Phase 1 |
+| Break-in recovery (Double Ratchet self-healing) | ✅ Phase 1 (implementation-level; not separately adversarially tested — relies on upstream libsignal-protocol) |
 | Hardware-backed key storage (Android Keystore / iOS Secure Enclave) | ✅ Phase 1 |
+| Envelope wire-format versioning (explicit error on mismatch) | ✅ Sub-Phase 2A |
+| Sender-receiver unlinkability **from the relay operator** (sealed sender) | ✅ Sub-Phase 2A |
+| Relay store encrypted at rest (SQLCipher) | ✅ Sub-Phase 2A |
+| Relay store survives restart | ✅ Sub-Phase 2A |
+| Sender-receiver unlinkability under **network-level traffic timing analysis** | 🔲 Sub-Phase 2B |
+| Mix-network metadata resistance (Sphinx routing, cover traffic) | 🔲 Sub-Phase 2B |
 | Cryptographic self-destruct | 🔲 Phase 3 |
-| Sender-receiver unlinkability / sealed sender | 🔲 Phase 2 |
-| Mix-network metadata resistance | 🔲 Phase 2 |
 | Offline mesh dead-drop | 🔲 Phase 4 |
 | Post-quantum key encapsulation (ML-KEM) | 🔲 Phase 5 |
 
@@ -137,8 +141,9 @@ The following limitations apply and must be understood before any evaluation:
 - **No FIPS 140-3 validation.** Cryptographic modules have not undergone formal FIPS certification.
 - **No formal security audit.** The codebase has not been independently audited by a third-party cryptographic firm.
 - **Not accredited for classified networks.** PARDA has no ATO (Authority to Operate), does not comply with RMF/DIACAP, and must not be used on any classified infrastructure.
-- **Relay server sees sender → recipient metadata in Phase 1.** Sealed-sender envelopes are a Phase 2 deliverable.
-- **In-memory relay store.** Messages are lost on server restart. Persistent storage arrives in Phase 2.
+- **Relay server still sees sender → recipient metadata for any envelope sent with `sealed_sender = false`** — true of every Phase 1 peer, and any Phase 2 peer that doesn't opt in for a given message.
+- **Sealed sender hides identity, not IP address.** The relay still sees the connecting TCP source IP; sealed sender is an application-layer property, not a network-anonymity one. IP-level unlinkability is Sub-Phase 2B's job (mix routing), not Sub-Phase 2A's.
+- **Sealed-sender certificate issuance has no account authentication behind it** — same Trust-On-First-Use posture Phase 1 already had for prekey bundle uploads. See `docs/THREAT_MODEL.md` §3.5.
 - **No TLS in server binary.** Use a reverse proxy (nginx/Caddy) with a valid certificate in any networked deployment.
 - **Side-channel mitigations are partial.** Constant-time implementations are targeted but not yet verified across all code paths.
 
@@ -195,7 +200,7 @@ cargo build --release       # Core cryptographic layer
 
 PARDA targets a threat model in which a **global passive adversary** can observe all network traffic, and an **active adversary** may compromise individual mix nodes or relay infrastructure, but cannot simultaneously compromise all nodes in a routing path or the sender/receiver endpoints. The system is designed to provide **sender-receiver unlinkability**, **message content confidentiality**, and **forward secrecy** under these conditions. Self-destruct mechanisms address the additional threat of **device seizure and forensic analysis** post-delivery. The system does *not* currently claim resistance to quantum adversaries or traffic analysis by adversaries with full mix-network compromise.
 
-📄 Full threat model: [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) *(draft — see Unreleased in CHANGELOG)*
+📄 Full threat model: [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) — finalized for Phase 1 + Sub-Phase 2A; Sub-Phase 2B mix-network sections document the design target, not yet implemented
 
 ---
 
