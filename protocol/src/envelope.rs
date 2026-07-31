@@ -21,9 +21,17 @@
 //!
 //! ## Phase 2-3 extension stubs
 //!
-//! `routing_hint` and `self_destruct_at` remain reserved and unused (`None`)
-//! until Sub-Phase 2B (mix routing) and Phase 3 (self-destruct) respectively.
-//! `sealed_sender` is now load-bearing: see below.
+//! `self_destruct_at` remains reserved and unused (`None`) until Phase 3
+//! (self-destruct). `sealed_sender` is now load-bearing: see below.
+//!
+//! `routing_hint` also stays unused/`None` — permanently, not just until
+//! some later phase fills it in. Sub-Phase 2B's mix routing
+//! (`parda_protocol::mixnet`, `protocol/src/transport.rs::MixTransport`)
+//! wraps the *entire serialised envelope* as a Sphinx packet payload
+//! rather than attaching a routing header to the envelope struct itself.
+//! `routing_hint` predates that design settling and is not the mechanism
+//! Sub-Phase 2B actually uses; it's left in place rather than removed so
+//! the wire format doesn't churn, but no code path ever populates it.
 
 use serde::{Deserialize, Serialize};
 
@@ -108,15 +116,31 @@ pub struct MessageEnvelope {
     /// `version >= ENVELOPE_VERSION_V2` and `envelope_type == SealedSender`.
     pub sealed_sender: bool,
 
-    /// Reserved for Sphinx-packet onion routing header (Sub-Phase 2B).
-    /// `None` until then.
+    /// Unused — permanently `None`. Sub-Phase 2B's mix routing wraps the
+    /// whole envelope as a Sphinx payload instead of using this field;
+    /// see module docs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing_hint: Option<Vec<u8>>,
 
-    // ── Phase 3 stub ─────────────────────────────────────────────────────
+    // ── Phase 3 (Sub-Phase 3A) ──────────────────────────────────────────
 
-    /// Unix epoch timestamp (ms) at which the message key should be deleted
-    /// on all endpoints. `None` in Phase 1 and 2 — Phase 3 stub, untouched.
+    /// Unix epoch timestamp (ms) at which the sender intends this
+    /// message to become unreadable. `None` for messages that don't
+    /// self-destruct.
+    ///
+    /// **This is advisory wire metadata, not the enforcement
+    /// mechanism.** It travels in plaintext alongside the envelope (the
+    /// relay and any mix node can see it, same as `timestamp_ms`), so it
+    /// must never be treated as secret, and a malicious relay/mix node
+    /// could in principle strip or alter it in transit. Actual
+    /// enforcement happens entirely on the receiving device, locally, via
+    /// `self_destruct::SelfDestructingMessage`'s monotonic-clock-anchored
+    /// timer (see `docs/phase3-3a-self-destruct-design.md`) — that timer
+    /// is what a receiver's own code must rely on, not trust in this
+    /// field surviving the wire intact. This field exists so a receiving
+    /// UI can *display* the intended expiry before it fires, and so the
+    /// receiver's `SelfDestructingMessage::seal` call has a `timestamp_ms`
+    /// to derive its key from — not as a security boundary.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub self_destruct_at: Option<u64>,
 }
@@ -149,6 +173,18 @@ impl MessageEnvelope {
             ));
         }
         Ok(())
+    }
+
+    /// Declare this envelope as self-destructing `expiry_window` after
+    /// `timestamp_ms`. Only sets the advisory wire field — see
+    /// [`Self::self_destruct_at`] docs for why this alone does not
+    /// enforce anything; the caller is still responsible for wrapping
+    /// the plaintext in a `self_destruct::SelfDestructingMessage` on the
+    /// receiving end.
+    #[must_use]
+    pub fn with_self_destruct(mut self, expiry_window: std::time::Duration) -> Self {
+        self.self_destruct_at = Some(self.timestamp_ms + expiry_window.as_millis() as u64);
+        self
     }
 }
 
