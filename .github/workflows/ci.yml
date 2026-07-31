@@ -1,0 +1,59 @@
+name: CI
+
+# Runs the full workspace test suite (parda-protocol, parda-relay) on every
+# push and pull request against main. This was listed as planned for 0.1.0
+# and had not been wired up before Phase 2 — see CHANGELOG.md.
+#
+# Both crates pull in components that need native build tooling beyond a
+# bare Rust toolchain:
+#   - parda-protocol depends on libsignal-protocol (git dependency), which
+#     needs `protoc` to build its protobuf types.
+#   - parda-relay depends on rusqlite's `bundled-sqlcipher-vendored-openssl`
+#     feature (see server/src/store.rs), which compiles SQLCipher and
+#     OpenSSL from source and therefore needs a working Perl (OpenSSL's
+#     Configure step) and a C toolchain. GitHub-hosted ubuntu-latest and
+#     windows-latest runners ship both out of the box.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # rust-cache and cargo both benefit from a stable target dir per-OS.
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protoc + clang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --workspace
+        run: cargo build --workspace --verbose
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --verbose
