@@ -50,6 +50,35 @@ pub enum PardaError {
     #[error("Sealed-sender authentication failed: {0}")]
     SealedSenderAuth(String),
 
+    /// Sphinx packet construction, forwarding, or unwrap failed (Sub-Phase
+    /// 2B mix routing) — malformed packet, path too long/short, wrong node
+    /// key, or an address that doesn't fit the fixed-size Sphinx address
+    /// encoding.
+    #[error("Mix routing error: {0}")]
+    MixRouting(String),
+
+    /// A self-destructing message's key is gone — either the expiry timer
+    /// already fired, `expire_now()` was called explicitly, or a read
+    /// trigger already consumed it (Sub-Phase 3B). The plaintext is not
+    /// recoverable; this is the intended, working state, not a bug.
+    #[error("Self-destructing message has already expired — key material is gone")]
+    SelfDestructExpired,
+
+    /// The device clock was observed to have moved backward relative to
+    /// the last persisted watermark — refused rather than trusted, per
+    /// Phase 3's fail-closed clock-integrity requirement. See
+    /// `clock_guard` module docs.
+    #[error(
+        "Clock rollback detected: observed {observed_ms}ms, last known-good was {watermark_ms}ms"
+    )]
+    ClockRollbackDetected { observed_ms: u64, watermark_ms: u64 },
+
+    /// AEAD encryption/decryption of a self-destructing message's
+    /// plaintext failed — wrong key (shouldn't happen given how the key
+    /// is derived), corrupted ciphertext, or tampering.
+    #[error("Self-destruct AEAD error: {0}")]
+    SelfDestructCrypto(String),
+
     /// Catch-all for unexpected conditions.
     #[error("Internal error: {0}")]
     Internal(String),
