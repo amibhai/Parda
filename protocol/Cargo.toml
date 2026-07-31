@@ -21,9 +21,26 @@ uuid        = { workspace = true }
 zeroize     = { workspace = true }
 rand        = "0.8"
 reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Sub-Phase 2B: Sphinx packet format (Danezis & Goldberg, IEEE S&P 2009).
+# Existing, production-used implementation (Nym Technologies mixnet) —
+# not hand-rolled onion crypto, per the no-custom-crypto constraint this
+# project already applies to the Signal Protocol layer. See
+# protocol/src/mixnet.rs module docs.
+sphinx-packet = "0.7"
+x25519-dalek  = { version = "3.0", features = ["static_secrets", "getrandom", "zeroize"] }
+# Phase 3 / Sub-Phase 3A: time-bound self-destruct key derivation and
+# encryption. HKDF (RFC 5869) + ChaCha20-Poly1305 AEAD — both RustCrypto,
+# no custom crypto. See docs/phase3-3a-self-destruct-design.md.
+hkdf = "0.12"
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+# Sub-Phase 3A's expiry timer (`self_destruct::SelfDestructingMessage`)
+# spawns a real background task and needs a timer — this makes tokio a
+# real runtime dependency of the library itself, not just of tests/bins
+# that happen to use one.
+tokio       = { workspace = true, features = ["full"] }
 
 [dev-dependencies]
-tokio       = { workspace = true, features = ["full"] }
 tokio-test  = "0.4"
 
 [[test]]
