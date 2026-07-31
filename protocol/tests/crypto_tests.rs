@@ -11,7 +11,7 @@
 //!
 //! All tests use the `InMemorySignalProtocolStore` — no network, no hardware.
 
-use libsignal_protocol::{IdentityKeyPair, ProtocolAddress};
+use libsignal_protocol::{GenericSignedPreKey, IdentityKeyPair, ProtocolAddress};
 use parda_protocol::{
     envelope::EnvelopeType,
     identity::LocalIdentity,
@@ -59,8 +59,8 @@ fn test_identity_key_generation() {
 
     // Identity key pair must be non-zero
     assert_ne!(
-        identity.identity_key_pair.public_key().serialize(),
-        [0u8; 33]
+        identity.identity_key_pair.public_key().serialize().to_vec(),
+        vec![0u8; 33]
     );
     // Signed prekey must have correct ID
     assert_eq!(
@@ -89,11 +89,11 @@ fn test_signed_prekey_signature_is_valid() {
     let identity = LocalIdentity::generate(42).unwrap();
     let sig = identity.signed_prekey.signature().unwrap();
     let pub_bytes = identity.signed_prekey.public_key().unwrap().serialize();
-    let verify_result = identity
+    let verified = identity
         .identity_key_pair
         .public_key()
-        .verify_signature(&pub_bytes, sig);
-    assert!(verify_result.is_ok(), "signed prekey signature must verify");
+        .verify_signature(&pub_bytes, &sig);
+    assert!(verified, "signed prekey signature must verify");
 }
 
 // ─── Test 2: Prekey bundle construction ──────────────────────────────────────
@@ -102,7 +102,7 @@ fn test_signed_prekey_signature_is_valid() {
 fn test_prekey_bundle_construction() {
     let identity = LocalIdentity::generate(7).unwrap();
     let bundle = identity.build_prekey_bundle();
-    assert!(bundle.is_ok(), "build_prekey_bundle must succeed: {:?}", bundle);
+    assert!(bundle.is_ok(), "build_prekey_bundle must succeed");
     let bundle = bundle.unwrap();
     // Bundle registration ID must match
     assert_eq!(bundle.registration_id().unwrap(), 7);
@@ -112,7 +112,7 @@ fn test_prekey_bundle_construction() {
 
 #[tokio::test]
 async fn test_x3dh_session_initiation() {
-    let (bob_identity, bob_store, bob_addr) = make_identity_and_store("bob", 2);
+    let (bob_identity, _bob_store, bob_addr) = make_identity_and_store("bob", 2);
     let alice_ikp = IdentityKeyPair::generate(&mut OsRng);
     let alice_store = InMemorySignalProtocolStore::new(alice_ikp, 1);
     let alice_addr = ProtocolAddress::new("alice".to_string(), 1.into());
@@ -188,7 +188,12 @@ async fn test_multi_message_ratchet_advancement() {
     for (i, &msg) in messages.iter().enumerate() {
         let envelope = alice.encrypt(&bob_addr, msg.as_bytes()).await.unwrap();
 
-        // Only first message is PreKey; rest are Ratchet.
+        // Per the Signal Protocol spec, Alice keeps wrapping outgoing messages
+        // as PreKeySignalMessage until she has processed a reply from Bob on
+        // this session (libsignal clears `unacknowledged_pre_key_message`
+        // only on the receiving side of a session). A one-way message stream
+        // therefore stays PreKey the whole way; only after Bob acks does
+        // Alice's session drop back to plain Ratchet messages.
         if i == 0 {
             assert_eq!(envelope.envelope_type, EnvelopeType::PreKey);
         } else {
@@ -197,6 +202,14 @@ async fn test_multi_message_ratchet_advancement() {
 
         let decrypted = bob.decrypt(&envelope).await.unwrap();
         assert_eq!(decrypted, msg.as_bytes(), "message {} mismatch", i);
+
+        if i == 0 {
+            // Bob acks so Alice's session clears its unacknowledged-prekey
+            // state, matching a real bidirectional conversation.
+            let ack = bob.encrypt(&alice_addr, b"ack").await.unwrap();
+            let ack_plain = alice.decrypt(&ack).await.unwrap();
+            assert_eq!(ack_plain, b"ack");
+        }
     }
 }
 
@@ -252,6 +265,7 @@ fn test_envelope_json_roundtrip() {
         ciphertext: vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE],
         envelope_type: EnvelopeType::PreKey,
         timestamp_ms: 1_700_000_000_000,
+        version: parda_protocol::envelope::ENVELOPE_VERSION_V2,
         sealed_sender: false,
         routing_hint: None,
         self_destruct_at: None,
@@ -266,7 +280,66 @@ fn test_envelope_json_roundtrip() {
     assert_eq!(decoded.ciphertext, envelope.ciphertext);
     assert_eq!(decoded.envelope_type, envelope.envelope_type);
     assert_eq!(decoded.timestamp_ms, envelope.timestamp_ms);
+    assert_eq!(decoded.version, envelope.version);
     assert!(!decoded.sealed_sender);
     assert!(decoded.routing_hint.is_none());
     assert!(decoded.self_destruct_at.is_none());
+}
+
+#[test]
+fn test_envelope_missing_version_defaults_to_v1() {
+    // Phase 1 clients never wrote a `version` field. A Phase 2 receiver must
+    // still be able to parse that JSON and treat it as version 1, rather
+    // than failing to deserialise legacy data.
+    use parda_protocol::envelope::{EnvelopeType, MessageEnvelope, ENVELOPE_VERSION_V2, ENVELOPE_VERSION_V1};
+
+    let modern = MessageEnvelope {
+        sender_id: "alice".into(),
+        recipient_id: "bob".into(),
+        ciphertext: vec![0xAA],
+        envelope_type: EnvelopeType::PreKey,
+        timestamp_ms: 1_700_000_000_000,
+        version: ENVELOPE_VERSION_V2,
+        sealed_sender: false,
+        routing_hint: None,
+        self_destruct_at: None,
+    };
+    let mut value = serde_json::to_value(&modern).expect("serialise envelope");
+    value
+        .as_object_mut()
+        .expect("envelope serialises as a JSON object")
+        .remove("version");
+
+    let decoded: MessageEnvelope =
+        serde_json::from_value(value).expect("legacy envelope without `version` must parse");
+    assert_eq!(decoded.version, ENVELOPE_VERSION_V1);
+    assert_eq!(decoded.envelope_type, EnvelopeType::PreKey);
+    assert!(decoded.validate_version().is_ok());
+}
+
+#[test]
+fn test_envelope_future_version_rejected_explicitly() {
+    // A version this build does not understand must fail loud with a typed
+    // error, never be silently misinterpreted or panic.
+    use parda_protocol::envelope::{EnvelopeType, MessageEnvelope};
+
+    let from_the_future = MessageEnvelope {
+        sender_id: "alice".into(),
+        recipient_id: "bob".into(),
+        ciphertext: vec![0xAA],
+        envelope_type: EnvelopeType::Ratchet,
+        timestamp_ms: 1_700_000_000_000,
+        version: 99,
+        sealed_sender: false,
+        routing_hint: None,
+        self_destruct_at: None,
+    };
+
+    let err = from_the_future
+        .validate_version()
+        .expect_err("version 99 must be rejected");
+    assert!(matches!(
+        err,
+        parda_protocol::PardaError::UnsupportedEnvelopeVersion { got: 99, .. }
+    ));
 }

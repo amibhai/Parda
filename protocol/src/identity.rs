@@ -12,8 +12,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use libsignal_protocol::{
-    IdentityKey, IdentityKeyPair, KeyPair, PreKeyId, PreKeyRecord,
-    SignedPreKeyId, SignedPreKeyRecord, PreKeyBundle,
+    GenericSignedPreKey, IdentityKey, IdentityKeyPair, KeyPair, PreKeyId, PreKeyRecord,
+    SignedPreKeyId, SignedPreKeyRecord, PreKeyBundle, Timestamp,
 };
 use rand::rngs::OsRng;
 
@@ -63,7 +63,7 @@ impl LocalIdentity {
 
         let signed_prekey = SignedPreKeyRecord::new(
             SignedPreKeyId::from(1u32),
-            now_ms,
+            Timestamp::from_epoch_millis(now_ms),
             &signed_prekey_pair,
             &signature,
         );
