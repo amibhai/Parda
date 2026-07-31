@@ -1,0 +1,30 @@
+[package]
+name        = "parda-mixnode"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+description = "PARDA mix-network node — Sphinx packet forwarding, Loopix-style per-hop mixing delay, and drop-cover traffic (Sub-Phase 2B)"
+
+[dependencies]
+axum           = { version = "0.7", features = ["json", "macros"] }
+tokio          = { workspace = true, features = ["full"] }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+tracing        = { workspace = true }
+tracing-subscriber = { workspace = true }
+base64         = { workspace = true }
+tower-http     = { version = "0.5", features = ["trace", "cors"] }
+reqwest        = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rand           = "0.8"
+# Shared Sphinx packet build/unwrap logic and MessageEnvelope types — see
+# protocol/src/mixnet.rs. A mix node deliberately does not depend on
+# sphinx-packet directly; it goes through parda_protocol::mixnet only.
+parda-protocol = { path = "../protocol" }
+
+[dev-dependencies]
+tokio         = { workspace = true, features = ["full"] }
+# Integration tests spin up a real ephemeral relay alongside real mix
+# nodes (all on real loopback TCP sockets — see tests/common/mod.rs for
+# why axum-test's mocked transport doesn't fit here) so packets actually
+# traverse HTTP the way `MixTransport`/`mixing::forward` do in production.
+parda-relay   = { path = "../server" }
