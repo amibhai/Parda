@@ -6,29 +6,36 @@
 //!
 //! - This server stores and delivers opaque ciphertext blobs only.
 //! - It **cannot** decrypt any message — all key material lives on client devices.
-//! - It **can** see sender → recipient metadata in Phase 1. Phase 2 (sealed-sender)
-//!   will remove this visibility.
+//! - It **can** see sender → recipient metadata for envelopes that don't opt
+//!   into sealed sender (`sealed_sender = false`; still true for any Phase 1
+//!   peer, and any Phase 2 peer that chooses not to seal a given message).
+//!   For `sealed_sender = true` envelopes, this server's code path never
+//!   reads or logs a sender identity — see `routes.rs` module docs and
+//!   `server/tests/sealed_sender_relay_tests.rs`.
+//! - This server also hosts the sealed-sender certificate authority
+//!   (`/v1/certs/*`) — see `parda_protocol::sealed_sender` module docs for
+//!   what that does and does not authenticate.
+//! - The store is a SQLCipher database, encrypted at rest — see `store.rs`
+//!   module docs. Messages now survive a relay restart (Phase 1 Known Risk
+//!   #2 in `docs/phase1-architecture.md` §10 is resolved as of Phase 2).
 //!
 //! ## Running
 //!
 //! ```bash
-//! PARDA_BIND=0.0.0.0:8080 cargo run -p parda-relay
+//! PARDA_DB_KEY=$(openssl rand -hex 32) \
+//! PARDA_DB_PATH=./data/parda-relay.sqlite3 \
+//! PARDA_BIND=0.0.0.0:8080 \
+//! cargo run -p parda-relay
 //! ```
 //!
-//! Default bind address: `127.0.0.1:8080`
+//! `PARDA_DB_KEY` is required — the store is a SQLCipher database encrypted
+//! at rest (see `store.rs` module docs) and refuses to start with a default
+//! or missing key. `PARDA_DB_PATH` defaults to `parda-relay.sqlite3` in the
+//! working directory. Default bind address: `127.0.0.1:8080`.
 
-mod models;
-mod routes;
-mod store;
-
-use axum::{
-    routing::{delete, get, post},
-    Router,
-};
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use store::RelayStore;
+use parda_relay::{app, store::RelayStore};
 
 #[tokio::main]
 async fn main() {
@@ -42,25 +49,7 @@ async fn main() {
     let store = RelayStore::new();
 
     // ── Router ─────────────────────────────────────────────────────────────
-    let app = Router::new()
-        // Health
-        .route("/health", get(routes::health))
-        // Prekey bundle management
-        .route("/v1/keys/:user_id",   post(routes::upload_prekey_bundle))
-        .route("/v1/keys/:user_id",   get(routes::get_prekey_bundle))
-        // Message store-and-forward
-        .route("/v1/messages/:user_id",           get(routes::fetch_messages))
-        .route("/v1/messages/:recipient_id",      post(routes::submit_message))
-        .route("/v1/messages/:user_id/:msg_id",   delete(routes::delete_message))
-        // Middleware
-        .layer(TraceLayer::new_for_http())
-        .layer(
-            CorsLayer::new()
-                .allow_origin(tower_http::cors::Any)
-                .allow_methods(tower_http::cors::Any)
-                .allow_headers(tower_http::cors::Any),
-        )
-        .with_state(store);
+    let app = app(store);
 
     // ── Bind & serve ───────────────────────────────────────────────────────
     let bind_addr = std::env::var("PARDA_BIND")
@@ -75,8 +64,8 @@ async fn main() {
         "PARDA relay server listening"
     );
     tracing::warn!(
-        "Phase 1 relay: sender/recipient metadata is NOT hidden. \
-         Phase 2 will add sealed-sender envelopes."
+        "Sender metadata is hidden only for envelopes sent with sealed_sender = true. \
+         Phase 1 peers, and any Phase 2 peer not opting in, remain visible to this relay."
     );
 
     axum::serve(listener, app)
