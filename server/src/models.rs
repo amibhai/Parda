@@ -52,6 +52,39 @@ pub struct FetchMessagesResponse {
     pub messages: Vec<StoredEnvelope>,
 }
 
+/// `POST /v1/certs/{user_id}` request body.
+///
+/// The relay signs whatever identity key is presented here — there is no
+/// account authentication in Phase 2 (same Trust-On-First-Use posture as
+/// `/v1/keys/{user_id}` prekey bundle uploads). See
+/// `parda_protocol::sealed_sender` module docs and `docs/THREAT_MODEL.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueSenderCertRequest {
+    /// Base64-encoded libsignal `PublicKey` bytes for the requesting
+    /// identity.
+    pub identity_key: String,
+    /// Device ID the certificate should be bound to (`1` for single-device).
+    pub device_id: u32,
+    /// Requested certificate lifetime in seconds. The relay may cap this.
+    pub ttl_secs: u64,
+}
+
+/// `POST /v1/certs/{user_id}` response body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SenderCertificateResponse {
+    /// Base64-encoded serialised `SenderCertificate`. The requester attaches
+    /// this to every sealed-sender message they send.
+    pub sender_certificate: String,
+}
+
+/// `GET /v1/certs/trust-root` response body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustRootResponse {
+    /// Base64-encoded libsignal `PublicKey` bytes. Clients pin this and
+    /// validate every sealed-sender message's certificate chain against it.
+    pub trust_root_public_key: String,
+}
+
 /// Generic API success response.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ApiOk {
