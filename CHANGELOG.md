@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Sub-Phase 3A (Time-Bound Self-Destruct Key Derivation & Zeroize-on-Expiry)
+
+#### Design
+- `docs/phase3-3a-self-destruct-design.md` (new): the required pre-implementation design note, covering the KDF chain, why the key is derived from a fresh local secret rather than the (libsignal-inaccessible) Double-Ratchet message key, the monotonic-clock + rollback-watermark clock-trust mitigation and its documented limits, and — added during implementation — a real design flaw the memory-forensics test itself caught (see below)
+
+#### Protocol Layer (`/protocol`)
+- `self_destruct` module (new): `SelfDestructingMessage::seal`/`open`/`expire_now`/`open_with_clock_guard` — HKDF-SHA256 (RFC 5869, `hkdf` crate) derives a time-bound key from a fresh `OsRng` secret (never the Double-Ratchet key — see design note §1), ChaCha20-Poly1305 (RustCrypto) re-encrypts the recovered plaintext under it, and a monotonic-clock-anchored `tokio` timer erases the key at expiry. `DestructMode::{TimeBound, ReadTriggered}` exists now for HKDF domain separation ahead of Sub-Phase 3B; only `TimeBound` is implemented
+- `clock_guard` module (new): `ClockWatermarkStore` trait + `InMemoryClockWatermarkStore`, `check_clock_integrity` — detects a wall-clock rollback across a process restart via a persisted watermark and fails closed rather than trusting a clock proven to have moved backward
+- `error` module: `PardaError::SelfDestructExpired`, `PardaError::ClockRollbackDetected`, `PardaError::SelfDestructCrypto`
+- `envelope` module: `MessageEnvelope::with_self_destruct()` sets the (advisory-only — see module docs on why it isn't the enforcement mechanism) `self_destruct_at` wire field
+- `Cargo.toml`: `hkdf`, `chacha20poly1305`, `sha2` added; `tokio` moved from dev-dependencies to a real dependency (the expiry timer needs a runtime in the library itself, not just in tests)
+
+#### Tests (`/protocol/src/self_destruct.rs`, `/protocol/tests`)
+- Inline `#[cfg(test)]` unit tests (white-box, need private-field access): seal/open round-trip, `expire_now` fails closed, KDF domain separation by mode and by timestamp
+- **Memory-forensics tests** — the sub-phase's actual deliverable: `test_erase_zeroizes_before_clearing_and_ends_up_gone` reads the key through a live, type-stable reference immediately before/after the explicit zeroize call (the same pattern the `zeroize` crate's own test suite uses); `test_zeroize_overwrites_key_bytes_on_ordinary_drop_too` proves `ZeroizeOnDrop` fires on the normal Rust drop path via `ptr::drop_in_place`; `linux_memory_scan_tests::test_key_bytes_absent_from_process_memory_after_expiry` (Linux-only, runs in the `ubuntu-latest` CI leg) scans all of `/proc/self/mem` for the key's exact bytes before and after erasure, with a sanity check that the scan technique can actually find data that's really there
+- `protocol/tests/self_destruct_tests.rs` — black-box functional tests: real-timer expiry (not just `expire_now()`'s synchronous shortcut) fails closed; a not-yet-expired message stays readable; clock rollback is detected, reported, and permanently (not just for one call) expires the affected message without affecting other pending messages; `MessageEnvelope::with_self_destruct` sets the expected deadline
+
+#### A real bug the memory-forensics test caught
+The first implementation of key erasure did `*guard = None` directly on an `Option<DerivedKey>`. This does run `DerivedKey`'s `ZeroizeOnDrop` (a genuine volatile zero-write occurs), but the test — reading the same address via a pointer captured before the `Option` changed shape — intermittently found non-zero, pointer-shaped garbage instead of zeros. Root cause: once an `Option`'s variant changes, nothing guarantees the former payload bytes stay as whatever `Drop` last wrote, even inside a still-live allocation. Fixed by zeroizing explicitly while the value is still `Some`, then clearing to `None` as a separate step (`self_destruct::erase`) — and the test was rewritten to read through a live reference rather than a stale raw pointer, matching how the `zeroize` crate's own tests verify themselves. Recorded in the design note §5a and here because it's exactly the "the deletion function ran ≠ the plaintext is unrecoverable" distinction the brief asked to hold this phase to.
+
+#### Documentation
+- `docs/THREAT_MODEL.md`: §3.4 (Device Seizure Adversary) updated from "Phase 3, not started" to Sub-Phase 3A's actual, narrower delivered scope — what's proven (live-memory erasure) versus what remains open (swap/cold-boot, read-trigger, rooted-device/powered-off-device clock-trust gaps); §5 status table updated with test citations
+- `README.md`: Status table rows for KDF, live-memory erasure, and clock-rollback detection moved to ✅ Sub-Phase 3A; five new limitations documented (DR-key substitution rationale, clock-trust gaps, swap/cold-boot not yet proven, pre-expiry memory dump is fundamentally undefendable); Components table updated
+
+### Added — Sub-Phase 2B (Sphinx Mix-Network Routing)
+
+#### New crate: `parda-mixnode` (`/mixnode`)
+- Standalone mix-node daemon, architecturally separate from `parda-relay` per this sub-phase's explicit requirement (routing/batching is a distinct service from store-and-forward)
+- `identity` module: X25519 node keypair loading (`MIXNODE_SECRET_KEY_HEX` env var, or ephemeral generation with a logged warning — no persistent/hardware-backed node identity yet)
+- `mixing` module: honors the sender-embedded per-hop Sphinx delay, then forwards to the next hop or delivers to the relay — a detached `tokio::spawn` per packet, deliberately not a batch-and-flush queue (see module docs for why batching would reintroduce a correlation signal)
+- `cover_traffic` module: Loopix-style "drop cover" traffic — exponentially-timed dummy Sphinx packets routed through `MIXNODE_PEERS`, tagged for silent discard at their final hop; a node with fewer than 3 configured peers emits none, logged as a limitation rather than silently degraded
+- `routes`/`lib.rs`: `app(state)` Axum router (`GET /health`, `GET /mix/pubkey`, `POST /mix/packet`) mirroring `parda_relay::app(store)`'s test-without-TCP-bind pattern
+- `main.rs`: daemon binary, env-configured (`MIXNODE_BIND`, `MIXNODE_RELAY_URL`, `MIXNODE_SECRET_KEY_HEX`, `MIXNODE_COVER_AVG_INTERVAL_MS`, `MIXNODE_PEERS`)
+
+#### Protocol Layer (`/protocol`)
+- `mixnet` module (new): Sphinx packet construction/unwrap built on the `sphinx-packet` crate (Nym Technologies, Apache-2.0, v0.7.0 — Danezis & Goldberg, IEEE S&P 2009) — no custom onion crypto. `MixTopology`/`MixNodeDescriptor` (static, trust-on-first-use node list), `build_packet`/`build_packet_to`, `process_packet` (`UnwrapOutcome::{Forward, Deliver, DropCover}`), fixed-size address encoding so a node never needs its own topology copy, `RELAY_DESTINATION_TAG`/`COVER_DESTINATION_TAG` final-hop markers (an unrecognised tag is refused, not guessed at)
+- `transport` module: `MixTransport` replaces the previous `unimplemented!()` stub — real Sphinx-routed `send()` (fails closed, no fallback to a direct relay POST if the mix network is unreachable) and a `receive()` identical to `DirectTransport`'s (receive-path anonymization is explicitly out of scope for this sub-phase — see module docs)
+- `error` module: `PardaError::MixRouting`
+- `Cargo.toml`: `sphinx-packet = "0.7"`, `x25519-dalek = "3.0"`
+
+#### Tests (`/protocol/tests`, `/mixnode/tests`)
+- `protocol/tests/mixnet_tests.rs` — 9 tests: 3-hop packet round-trips envelope bit-identical; wrong key fails closed; drop-cover packets terminate as `DropCover` not `Deliver`; an unrecognised final-hop destination tag is refused; path-length and topology-size minimums enforced; `MixTransport::send` fails closed (returns `Err`, no relay fallback exists in the code path) when the first hop is unreachable
+- `mixnode/tests/timing_correlation_tests.rs::test_send_to_arrival_timing_does_not_leak_flow_pairing_above_chance` — the sub-phase's deliverable gate: spins up 5 real mix-node daemons plus a real ephemeral relay (genuine loopback HTTP, not a mocked transport), routes 8 concurrent flows over independently-chosen 3-hop paths, and runs a permutation test on the Spearman rank correlation between send-order and relay-arrival-order for the true pairing against 5,000 random re-pairings. Documented explicitly as an empirical result bounded to the tested scale, not a formal anonymity proof
+- `mixnode/tests/degradation_tests.rs` — 2 tests: a hop that silently drops a packet degrades the system to "message never arrives" (not misdelivery, and the sender's own HTTP response never reveals which downstream hop misbehaved); a hop with injected extra latency still delivers the correct plaintext, later than baseline
+
+#### Documentation
+- `docs/THREAT_MODEL.md`: §3.1 (GPA) — added a precise account of what Sub-Phase 2B does and does not defend against; §3.2 and §3.6 moved from "design target, not yet implemented" to implemented with test citations, including the honest empirical/scale-bounded framing of the timing-correlation result; §4 — added static-topology/no-directory-authority and receive-path-unanonymized as explicit out-of-scope items; §5 status table updated
+- `docs/phase1-architecture.md`: new §12 addendum recording the `sphinx-packet` dependency decision and alternatives considered, the sender-sampled-delay design choice, and the "nodes carry no topology" decision
+- `README.md`: Status table rows for send-path unlinkability, mix-network metadata resistance, and fail-safe degradation moved to ✅ Sub-Phase 2B; new limitations documented (static topology/no directory authority, receive-path not anonymized, cover traffic needs peer config, timing-correlation result is empirical/scale-bounded, mix-node identity is ephemeral); Components table updated with `/mixnode`
+
 ### Added — Sub-Phase 2A (Sealed Sender + Persistence)
 
 #### Protocol Layer (`/protocol`)

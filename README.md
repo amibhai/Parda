@@ -100,7 +100,7 @@ Each phase produces independently testable deliverables. Phases 1–3 target sta
 | Layer | Technology |
 |-------|-----------|
 | **Encryption / Ratchet** | `libsignal-client` (Rust), `ring` |
-| **Mix Routing** | Sphinx packet library (Rust/Go), Loopix-derived scheduler |
+| **Mix Routing** | `sphinx-packet` crate (Rust, Nym Technologies), Loopix-style per-hop delay + drop-cover traffic |
 | **Transport** | gRPC (mTLS), optional Tor hidden service |
 | **Offline Mesh** | BLE (BlueZ / CoreBluetooth), Wi-Fi Direct, `dtn7-rs` |
 | **Secure Storage** | SQLCipher, OS-native Keystore (Android Keystore / iOS Secure Enclave) |
@@ -115,7 +115,7 @@ Each phase produces independently testable deliverables. Phases 1–3 target sta
 
 > ⚠️ **RESEARCH PROTOTYPE — NOT FOR OPERATIONAL DEPLOYMENT**
 
-**Current phase: Phase 2, Sub-Phase 2A complete (Sealed Sender + persistence) — Sub-Phase 2B (mix-network routing) not yet started**
+**Current phase: Phase 2 complete (Sub-Phase 2A + Sub-Phase 2B). Phase 3, Sub-Phase 3A (time-bound self-destruct key derivation + zeroize-on-expiry) implemented and tested — Sub-Phases 3B (read-triggered), 3C (swap/cold-boot hardening), and 3D (application layer) not yet started.**
 
 Every ✅ below is backed by a named test — see `docs/THREAT_MODEL.md` §5 for the exact test each row cites. A property is never marked done on the strength of the implementation alone.
 
@@ -129,9 +129,15 @@ Every ✅ below is backed by a named test — see `docs/THREAT_MODEL.md` §5 for
 | Sender-receiver unlinkability **from the relay operator** (sealed sender) | ✅ Sub-Phase 2A |
 | Relay store encrypted at rest (SQLCipher) | ✅ Sub-Phase 2A |
 | Relay store survives restart | ✅ Sub-Phase 2A |
-| Sender-receiver unlinkability under **network-level traffic timing analysis** | 🔲 Sub-Phase 2B |
-| Mix-network metadata resistance (Sphinx routing, cover traffic) | 🔲 Sub-Phase 2B |
-| Cryptographic self-destruct | 🔲 Phase 3 |
+| Sender-receiver unlinkability under **network-level traffic timing analysis** (send path) | ✅ Sub-Phase 2B |
+| Mix-network metadata resistance (Sphinx routing, per-hop mixing delay, drop-cover traffic) | ✅ Sub-Phase 2B |
+| Mix routing degrades to loss/delay — never deanonymization — when a hop misbehaves | ✅ Sub-Phase 2B |
+| Sender-receiver unlinkability under GPA observation of the **receive/fetch path** | 🔲 Not yet implemented |
+| Time-bound self-destruct key derivation (HKDF, local secret — not the Double-Ratchet key, see limitations) | ✅ Sub-Phase 3A |
+| Self-destruct key provably erased from live process memory at expiry | ✅ Sub-Phase 3A |
+| Clock-rollback detection for expiry, fail-closed | ✅ Sub-Phase 3A |
+| Read-triggered self-destruct | 🔲 Sub-Phase 3B |
+| Self-destruct swap/cold-boot/forensic-recovery hardening | 🔲 Sub-Phase 3C |
 | Offline mesh dead-drop | 🔲 Phase 4 |
 | Post-quantum key encapsulation (ML-KEM) | 🔲 Phase 5 |
 
@@ -142,21 +148,31 @@ The following limitations apply and must be understood before any evaluation:
 - **No formal security audit.** The codebase has not been independently audited by a third-party cryptographic firm.
 - **Not accredited for classified networks.** PARDA has no ATO (Authority to Operate), does not comply with RMF/DIACAP, and must not be used on any classified infrastructure.
 - **Relay server still sees sender → recipient metadata for any envelope sent with `sealed_sender = false`** — true of every Phase 1 peer, and any Phase 2 peer that doesn't opt in for a given message.
-- **Sealed sender hides identity, not IP address.** The relay still sees the connecting TCP source IP; sealed sender is an application-layer property, not a network-anonymity one. IP-level unlinkability is Sub-Phase 2B's job (mix routing), not Sub-Phase 2A's.
+- **Sealed sender hides identity, not IP address.** The relay still sees the connecting TCP source IP for the *final* mix hop, not the true sender's IP; sealed sender is an application-layer property, not a network-anonymity one on its own.
 - **Sealed-sender certificate issuance has no account authentication behind it** — same Trust-On-First-Use posture Phase 1 already had for prekey bundle uploads. See `docs/THREAT_MODEL.md` §3.5.
-- **No TLS in server binary.** Use a reverse proxy (nginx/Caddy) with a valid certificate in any networked deployment.
+- **No TLS in server binary or mix nodes.** Use a reverse proxy (nginx/Caddy) with a valid certificate in any networked deployment.
 - **Side-channel mitigations are partial.** Constant-time implementations are targeted but not yet verified across all code paths.
+- **Mix-network topology has no directory authority.** `MixTopology` is a static, trust-on-first-use configured list — same posture as prekey bundle upload and sealed-sender cert issuance. No freshness, revocation, or decentralized consensus. See `docs/THREAT_MODEL.md` §3.6, §4.
+- **Mix routing anonymizes the send path only.** Fetching messages (`MixTransport::receive`) still talks to the relay directly, exactly like `DirectTransport` — the pull side is not yet anonymized. See `docs/THREAT_MODEL.md` §3.1, §3.6.
+- **Cover traffic requires peer configuration.** A mix node with fewer than 3 configured `MIXNODE_PEERS` emits no cover traffic at all (logged, not silently degraded) — its real-traffic volume alone remains observable to a GPA at that node's edges.
+- **The timing-correlation resistance claim is empirical, not a formal proof.** `mixnode/tests/timing_correlation_tests.rs` demonstrates no above-chance send/arrival correlation via a permutation test at a specific tested scale (path length, node count, delay parameters) — it does not establish anonymity at arbitrary traffic volumes or configurations. See `docs/THREAT_MODEL.md` §3.6.
+- **Mix-node identity is ephemeral.** No persistent or hardware-backed mix-node identity exists yet (`mixnode/src/identity.rs`) — a restarted node's public key changes, breaking any peer's cached topology entry for it.
+- **Self-destruct key is not literally derived from the Double-Ratchet message key.** Libsignal's public API never exposes that key to PARDA's code (confirmed by reading the pinned `v0.66.0` source) — reaching for it would mean forking libsignal or reimplementing decryption ourselves, both of which reopen the no-custom-crypto risk this project already rejected once. Instead, a fresh local secret is generated at decrypt time and HKDF-derives the self-destruct key; self-destruct is a per-device guarantee about the *recovered plaintext's* lifetime, not shared protocol state. See `docs/phase3-3a-self-destruct-design.md` §1.
+- **Self-destruct clock trust has known, unsolved gaps.** A monotonic timer plus a persisted rollback-detection watermark defeats an adversary who changes the device's wall clock through ordinary means. **It does not defend against a rooted/jailbroken device that can also rewrite the persisted watermark file, nor against a device that's powered off and never allowed to run the app process again** — no user-space mechanism can fire if the process never executes. See `docs/phase3-3a-self-destruct-design.md` §3.
+- **Self-destruct expiry is not yet proven against swap, hibernation, or cold-boot RAM extraction.** Sub-Phase 3A proves the key is gone from *live, resident* process memory (`protocol/src/self_destruct.rs` memory-forensics tests) — it says nothing about whether a copy was paged to disk before erasure ran. That's Sub-Phase 3C's job (`mlock`/swap-avoidance), not yet implemented.
+- **An adversary with a memory dump taken before expiry fires always recovers the plaintext.** No cryptographic self-destruct scheme changes this; it isn't a gap specific to PARDA's implementation, but it's stated here because it's easy to imply otherwise by omission.
 
 This project is published for research, academic review, and engineering demonstration purposes only.
 
 ---
 
-## Phase 1 Components
+## Components
 
 | Directory | Description |
 |-----------|-------------|
-| [`/protocol`](protocol/) | Rust: libsignal-protocol wrapper (X3DH, Double Ratchet, key gen) |
-| [`/server`](server/) | Rust/Axum: dumb-pipe relay server (store-and-forward) |
+| [`/protocol`](protocol/) | Rust: libsignal-protocol wrapper (X3DH, Double Ratchet, key gen), sealed sender, Sphinx mix-network packet build/unwrap (`mixnet`), transport abstraction, time-bound self-destruct (`self_destruct`, `clock_guard`) |
+| [`/server`](server/) | Rust/Axum: dumb-pipe relay server (store-and-forward), SQLCipher persistence, sealed-sender certificate authority |
+| [`/mixnode`](mixnode/) | Rust/Axum: mix-network node daemon — Sphinx forwarding, per-hop mixing delay, drop-cover traffic (Sub-Phase 2B) |
 | [`/mobile`](mobile/) | Flutter: cross-platform client with Android Keystore integration |
 | [`/docs`](docs/) | Architecture decisions, threat model |
 
@@ -200,7 +216,7 @@ cargo build --release       # Core cryptographic layer
 
 PARDA targets a threat model in which a **global passive adversary** can observe all network traffic, and an **active adversary** may compromise individual mix nodes or relay infrastructure, but cannot simultaneously compromise all nodes in a routing path or the sender/receiver endpoints. The system is designed to provide **sender-receiver unlinkability**, **message content confidentiality**, and **forward secrecy** under these conditions. Self-destruct mechanisms address the additional threat of **device seizure and forensic analysis** post-delivery. The system does *not* currently claim resistance to quantum adversaries or traffic analysis by adversaries with full mix-network compromise.
 
-📄 Full threat model: [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) — finalized for Phase 1 + Sub-Phase 2A; Sub-Phase 2B mix-network sections document the design target, not yet implemented
+📄 Full threat model: [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) — finalized for Phase 1 + Sub-Phase 2A + Sub-Phase 2B
 
 ---
 
