@@ -32,6 +32,24 @@ pub enum PardaError {
     #[error("Store error: {0}")]
     Store(String),
 
+    /// An envelope declared a wire format version this build does not
+    /// understand. Refused explicitly rather than decoded speculatively.
+    #[error(
+        "Unsupported envelope version {got}: this build supports up to {max_supported}"
+    )]
+    UnsupportedEnvelopeVersion { got: u8, max_supported: u8 },
+
+    /// A sealed-sender envelope was structurally inconsistent (e.g.
+    /// `sealed_sender = true` on a version-1 envelope, or the wrong
+    /// `envelope_type` for the sealed-sender path).
+    #[error("Malformed sealed-sender envelope: {0}")]
+    MalformedSealedSender(String),
+
+    /// Sender certificate failed validation (expired, wrong trust root,
+    /// bad signature) during sealed-sender decryption.
+    #[error("Sealed-sender authentication failed: {0}")]
+    SealedSenderAuth(String),
+
     /// Catch-all for unexpected conditions.
     #[error("Internal error: {0}")]
     Internal(String),
