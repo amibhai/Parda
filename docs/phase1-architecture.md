@@ -324,3 +324,85 @@ prerequisites below.
 (§9's Sphinx routing-hint work in Sub-Phase 2B will be the next one), per
 the explicit requirement that version mismatches fail loud rather than
 silently misinterpret bytes.
+
+---
+
+## 12. Sub-Phase 2B Addendum (Sphinx Mix-Network Routing)
+
+**Status:** Accepted | **Date:** 2026-07-31
+
+### Decision: `sphinx-packet` crate for Sphinx packet construction/unwrap
+
+**Library chosen:** `sphinx-packet` (crates.io, v0.7.0, Apache-2.0,
+`github.com/nymtech/sphinx`), maintained by Nym Technologies and used in
+production by the Nym mixnet.
+
+**Rationale:**
+- Implements the packet format from Danezis & Goldberg, "Sphinx: A
+  Compact and Provably Secure Mix Format" (IEEE S&P 2009) — the same
+  no-custom-crypto constraint from §2 applies here: assembling onion
+  encryption from primitives (AES/ChaCha20 + HMAC by hand) would risk
+  reintroducing protocol-level bugs an existing, production-exercised
+  implementation has already had scrutiny against.
+- Ships its own Poisson/exponential per-hop delay generator
+  (`header::delays::generate_from_average_duration`), which
+  `protocol/src/mixnet.rs` uses directly rather than reimplementing —
+  see §2's reasoning applied consistently.
+- Not published by the Signal Foundation (unlike `libsignal-protocol`),
+  so this is a materially different trust chain from Phase 1's crypto
+  dependency — recorded here explicitly rather than left implicit.
+
+**Alternatives considered:**
+
+| Alternative | Reason rejected |
+|-------------|-----------------|
+| Hand-rolled onion encryption (AES/ChaCha20 + HMAC layers) | Breaks the no-custom-crypto constraint (§2); mix-format bugs (e.g. malleable routing info, tagging attacks) are exactly the class of subtle protocol error published, audited formats exist to avoid. |
+| `sphinxcrypto` crate (crates.io) | A "concrete parameterization of the Sphinx cryptographic packet format," but with a smaller install base and no equivalent production deployment backing it at the time of this decision. |
+| Building mix routing directly into `parda-relay` | Rejected per this sub-phase's explicit requirement to keep routing/batching architecturally separate from store-and-forward, even though both may co-locate in a dev deployment — see `mixnode/Cargo.toml`. |
+
+### Decision: sender-sampled, node-honored per-hop delay (not node-sampled)
+
+Per-hop mixing delay is sampled once by the sender (`mixnet::build_packet`)
+and embedded in the Sphinx header; each node (`mixnet::process_packet`)
+honors the delay it's handed rather than sampling its own. This is the
+actual Sphinx/Loopix design, not a PARDA simplification — a node that
+sampled its own delay could have that sampling process influenced,
+observed, or fingerprinted in ways the sender-committed approach avoids.
+Continuous-time (per-packet) delay was chosen over a batch-and-flush
+scheme because batching reintroduces a "which packets shared a batch"
+correlation signal that Loopix's design specifically avoids — see
+`mixnode/src/mixing.rs` module docs.
+
+### Decision: mix nodes carry no topology, only an optional peer list
+
+A mix node needs only its own keypair to forward traffic — the next
+hop's address is recovered directly from what it decrypts out of the
+Sphinx packet header (`protocol/src/mixnet.rs`, "Address encoding"). Only
+the client, which picks the *initial* path, needs the full
+`MixTopology`. This keeps a node's configuration surface small and
+avoids giving every node in the network a copy of the full topology
+(which would be a bigger information-leakage surface if any single node
+were compromised). The tradeoff: cover-traffic emission
+(`mixnode/src/cover_traffic.rs`) *does* need a small peer list
+(`MIXNODE_PEERS`) to build validly-encrypted cover packets — a node with
+no configured peers simply emits no cover traffic, logged as a
+limitation rather than silently degraded.
+
+### Known limitation carried forward
+
+`MixTopology` is a static, trust-on-first-use configured list — no
+decentralized directory authority, no freshness or revocation mechanism.
+Same trust posture already accepted for prekey bundle upload (§10 risk
+#3) and sealed-sender certificate issuance (§11). A production deployment
+needs a signed, Byzantine-fault-tolerant directory service; explicitly
+out of scope here — see `docs/THREAT_MODEL.md` §3.6 and §4.
+
+### Extension stubs resolved
+
+- `TransportLayer::MixTransport` (§7, previously a `unimplemented!()`
+  stub) is now a real implementation — see `protocol/src/transport.rs`.
+- `MessageEnvelope::routing_hint` (§7) remains unused/`None`. The design
+  wraps the *entire serialised envelope* as the Sphinx packet payload
+  rather than attaching a routing header to the envelope struct itself —
+  see `protocol/src/envelope.rs` module docs for why this isn't an
+  oversight.
