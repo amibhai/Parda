@@ -28,16 +28,34 @@
 use std::time::SystemTime;
 
 use libsignal_protocol::{
-    message_decrypt, message_encrypt, process_prekey_bundle, CiphertextMessage,
-    PreKeyBundle, ProtocolAddress,
+    message_decrypt, message_encrypt, process_prekey_bundle, sealed_sender_decrypt,
+    sealed_sender_encrypt, CiphertextMessage, DeviceId, PreKeyBundle, ProtocolAddress,
+    PublicKey, SenderCertificate, Timestamp,
 };
 use rand::rngs::OsRng;
 
 use crate::{
-    envelope::{MessageEnvelope, EnvelopeType},
+    envelope::{EnvelopeType, MessageEnvelope, ENVELOPE_VERSION_V2},
     error::{PardaError, Result},
     store::InMemorySignalProtocolStore,
 };
+
+/// Plaintext + authenticated sender identity recovered from a sealed-sender
+/// envelope. The sender identity here is trustworthy — it was validated
+/// against the sender certificate's signature chain during decryption, not
+/// taken from an attacker-controlled plaintext field.
+pub struct SealedSenderPlaintext {
+    pub sender_uuid: String,
+    pub device_id: DeviceId,
+    pub plaintext: Vec<u8>,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
 
 /// Wraps a single user's signal store and exposes encrypt / decrypt operations.
 pub struct SessionManager {
@@ -66,10 +84,14 @@ impl SessionManager {
         bundle: &PreKeyBundle,
     ) -> Result<()> {
         let mut rng = OsRng;
+        // `self.store` implements every storage trait on one handle; each
+        // parameter below needs its own live `&mut` borrow, so we hand out
+        // independent clones of the (Rc-backed) handle rather than the same
+        // place twice — see the module docs on `InMemorySignalProtocolStore`.
         process_prekey_bundle(
             remote_address,
-            &mut self.store, // session store
-            &mut self.store, // identity key store
+            &mut self.store.clone(), // session store
+            &mut self.store.clone(), // identity key store
             bundle,
             SystemTime::now(),
             &mut rng,
@@ -90,8 +112,8 @@ impl SessionManager {
         let ciphertext = message_encrypt(
             plaintext,
             remote_address,
-            &mut self.store, // session store
-            &mut self.store, // identity key store
+            &mut self.store.clone(), // session store
+            &mut self.store.clone(), // identity key store
             SystemTime::now(),
         )
         .await
@@ -108,14 +130,52 @@ impl SessionManager {
             recipient_id: remote_address.name().to_string(),
             ciphertext: ciphertext.serialize().to_vec(),
             envelope_type,
-            timestamp_ms: SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
-            // ── Phase 2 stubs ──
+            timestamp_ms: now_ms(),
+            version: ENVELOPE_VERSION_V2,
+            // ── Phase 2 (not used on this path — see `encrypt_sealed`) ──
             sealed_sender: false,
             routing_hint: None,
-            // ── Phase 3 stubs ──
+            // ── Phase 3 stub ──
+            self_destruct_at: None,
+        })
+    }
+
+    /// Encrypt `plaintext` for `remote_address` using sealed sender: the
+    /// relay (and anyone reading its logs/store) sees only `recipient_id`.
+    /// `sender_cert` must have been issued to this device's own identity key
+    /// by a `CertificateAuthority` the recipient trusts — see
+    /// [`crate::sealed_sender`].
+    pub async fn encrypt_sealed(
+        &mut self,
+        remote_address: &ProtocolAddress,
+        plaintext: &[u8],
+        sender_cert: &SenderCertificate,
+    ) -> Result<MessageEnvelope> {
+        let mut rng = OsRng;
+        let sealed_bytes = sealed_sender_encrypt(
+            remote_address,
+            sender_cert,
+            plaintext,
+            &mut self.store.clone(), // session store
+            &mut self.store.clone(), // identity key store
+            SystemTime::now(),
+            &mut rng,
+        )
+        .await
+        .map_err(PardaError::Signal)?;
+
+        Ok(MessageEnvelope {
+            // Never populated for sealed-sender envelopes: the true sender
+            // is recoverable only by the recipient, after decryption, via
+            // the certificate embedded in `ciphertext`.
+            sender_id: String::new(),
+            recipient_id: remote_address.name().to_string(),
+            ciphertext: sealed_bytes,
+            envelope_type: EnvelopeType::SealedSender,
+            timestamp_ms: now_ms(),
+            version: ENVELOPE_VERSION_V2,
+            sealed_sender: true,
+            routing_hint: None,
             self_destruct_at: None,
         })
     }
@@ -131,6 +191,8 @@ impl SessionManager {
         &mut self,
         envelope: &MessageEnvelope,
     ) -> Result<Vec<u8>> {
+        envelope.validate_version()?;
+
         let mut rng = OsRng;
         let sender_address =
             ProtocolAddress::new(envelope.sender_id.clone(), 1.into());
@@ -148,18 +210,75 @@ impl SessionManager {
                 )
                 .map_err(PardaError::Signal)?,
             ),
+            EnvelopeType::SealedSender => {
+                return Err(PardaError::MalformedSealedSender(
+                    "sealed-sender envelopes must be decrypted via decrypt_sealed, not decrypt"
+                        .to_string(),
+                ));
+            }
         };
 
         message_decrypt(
             &ciphertext,
             &sender_address,
-            &mut self.store, // session store
-            &mut self.store, // identity key store
-            &mut self.store, // prekey store
-            &mut self.store, // signed prekey store
+            &mut self.store.clone(), // session store
+            &mut self.store.clone(), // identity key store
+            &mut self.store.clone(), // prekey store
+            &self.store.clone(),     // signed prekey store (read-only in this call)
+            &mut self.store.clone(), // kyber prekey store (unused: no PQXDH until Phase 5)
             &mut rng,
         )
         .await
         .map_err(PardaError::Signal)
+    }
+
+    /// Decrypt a sealed-sender envelope produced by [`Self::encrypt_sealed`].
+    ///
+    /// Unlike [`Self::decrypt`], this does not trust `envelope.sender_id`
+    /// (it is empty on the wire — see `envelope` module docs); the sender
+    /// identity returned in [`SealedSenderPlaintext`] is instead recovered
+    /// from the embedded `SenderCertificate`, which libsignal validates
+    /// against `trust_root` (expiry + signature chain) *before* returning
+    /// any plaintext. A forged or expired certificate yields
+    /// [`PardaError::Signal`] here, never a plaintext.
+    ///
+    /// `local_uuid` / `local_device_id` are this device's own identity, used
+    /// only for libsignal's self-send loop-detection — they are not secret.
+    pub async fn decrypt_sealed(
+        &mut self,
+        envelope: &MessageEnvelope,
+        trust_root: &PublicKey,
+        local_uuid: &str,
+        local_device_id: DeviceId,
+    ) -> Result<SealedSenderPlaintext> {
+        envelope.validate_version()?;
+        if envelope.envelope_type != EnvelopeType::SealedSender {
+            return Err(PardaError::MalformedSealedSender(format!(
+                "decrypt_sealed requires envelope_type = SealedSender, got {:?}",
+                envelope.envelope_type
+            )));
+        }
+
+        let result = sealed_sender_decrypt(
+            &envelope.ciphertext,
+            trust_root,
+            Timestamp::from_epoch_millis(now_ms()),
+            None, // no e164 phone identifier in PARDA
+            local_uuid.to_string(),
+            local_device_id,
+            &mut self.store.clone(), // identity store
+            &mut self.store.clone(), // session store
+            &mut self.store.clone(), // prekey store
+            &self.store.clone(),     // signed prekey store (read-only in this call)
+            &mut self.store.clone(), // kyber prekey store (unused: no PQXDH until Phase 5)
+        )
+        .await
+        .map_err(PardaError::Signal)?;
+
+        Ok(SealedSenderPlaintext {
+            sender_uuid: result.sender_uuid,
+            device_id: result.device_id,
+            plaintext: result.message,
+        })
     }
 }
