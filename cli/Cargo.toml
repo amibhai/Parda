@@ -1,0 +1,21 @@
+[package]
+name        = "parda-cli"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+description = "PARDA CLI prototype — real send/receive over the Phase 1/2 transport stack, exercising self-destruct and session-burn end-to-end (Sub-Phase 3D)"
+
+# Depends on parda-client-store, which needs the vendored-SQLCipher/Perl
+# toolchain (see client-store/src/lib.rs module docs). Builds, and the
+# `demo` subcommand runs end-to-end — see main.rs module docs.
+[dependencies]
+parda-protocol      = { path = "../protocol" }
+parda-client-store  = { path = "../client-store" }
+tokio               = { workspace = true, features = ["full"] }
+axum                = { version = "0.7", features = ["json", "macros"] }
+serde_json          = { workspace = true }
+tracing             = { workspace = true }
+tracing-subscriber  = { workspace = true }
+clap                = { version = "4", features = ["derive"] }
+rand                = "0.8"
+libsignal-protocol  = { git = "https://github.com/signalapp/libsignal", tag = "v0.66.0", package = "libsignal-protocol" }
