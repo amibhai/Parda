@@ -179,24 +179,36 @@ class SignalPlugin : FlutterPlugin, MethodCallHandler {
         val remoteUserId = call.argument<String>("remoteUserId")!!
         val plaintext    = call.argument<ByteArray>("plaintext")!!
 
-        val remoteAddress  = SignalProtocolAddress(remoteUserId, 1)
-        val sessionCipher  = SessionCipher(store, remoteAddress)
-        val cipherMessage  = sessionCipher.encrypt(plaintext)
+        try {
+            val remoteAddress  = SignalProtocolAddress(remoteUserId, 1)
+            val sessionCipher  = SessionCipher(store, remoteAddress)
+            val cipherMessage  = sessionCipher.encrypt(plaintext)
 
-        val envelopeType = when (cipherMessage.type) {
-            CiphertextMessage.PREKEY_TYPE -> "pre_key"
-            else                           -> "ratchet"
+            val envelopeType = when (cipherMessage.type) {
+                CiphertextMessage.PREKEY_TYPE -> "pre_key"
+                else                           -> "ratchet"
+            }
+
+            val envelopeMap = mapOf(
+                "sender_id"      to (store.identityKeyPair?.let { "local" } ?: "unknown"),
+                "recipient_id"   to remoteUserId,
+                "ciphertext"     to b64(cipherMessage.serialize()),
+                "envelope_type"  to envelopeType,
+                "timestamp_ms"   to System.currentTimeMillis(),
+                "sealed_sender"  to false
+            )
+            result.success(envelopeMap)
+        } finally {
+            // Sub-Phase 3C mobile-bridge audit finding: `plaintext` is a
+            // plain JVM ByteArray handed to us across the MethodChannel
+            // boundary — nothing clears it once libsignal has consumed
+            // it, so it would otherwise sit as an unmanaged copy subject
+            // only to GC (not deterministic, not a real erasure) until
+            // collected. A `zeroize` call on the Dart side does nothing
+            // for this copy. `finally` so it's cleared on the exception
+            // path too, not just the success path.
+            java.util.Arrays.fill(plaintext, 0)
         }
-
-        val envelopeMap = mapOf(
-            "sender_id"      to (store.identityKeyPair?.let { "local" } ?: "unknown"),
-            "recipient_id"   to remoteUserId,
-            "ciphertext"     to b64(cipherMessage.serialize()),
-            "envelope_type"  to envelopeType,
-            "timestamp_ms"   to System.currentTimeMillis(),
-            "sealed_sender"  to false
-        )
-        result.success(envelopeMap)
     }
 
     // ── decryptMessage ────────────────────────────────────────────────────────
@@ -216,7 +228,24 @@ class SignalPlugin : FlutterPlugin, MethodCallHandler {
             "pre_key" -> sessionCipher.decrypt(PreKeySignalMessage(ciphertextBytes))
             else       -> sessionCipher.decrypt(SignalMessage(ciphertextBytes))
         }
-        result.success(plaintext)
+        try {
+            result.success(plaintext)
+        } finally {
+            // Same finding as handleEncryptMessage, more consequential
+            // here: this is the actual decrypted message content — the
+            // exact thing a self-destruct guarantee is supposed to
+            // protect once Sub-Phase 3D wires self-destruct into the
+            // mobile layer. `result.success()` hands the bytes to
+            // Flutter's binary messenger synchronously (it has its own
+            // copy by the time this call returns), so clearing `plaintext`
+            // immediately after does not corrupt what's already been
+            // sent — it only removes PARDA's own now-redundant Kotlin-side
+            // copy. This does NOT reach into Flutter/Dart's own copy of
+            // the bytes; that side of the boundary needs its own
+            // discipline (Dart-side zeroize on the resulting Uint8List),
+            // which is unaudited here — see docs/phase3-3a-self-destruct-design.md §9.
+            java.util.Arrays.fill(plaintext, 0)
+        }
     }
 
     // ── hasSession ────────────────────────────────────────────────────────────
