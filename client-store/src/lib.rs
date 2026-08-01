@@ -1,0 +1,278 @@
+//! Client-side encrypted local message store (SQLCipher) — Sub-Phase 3D.
+//!
+//! ## Build note: the Perl gap, and how it got resolved
+//!
+//! This crate uses the same vendored-SQLCipher approach
+//! `server/src/store.rs` already proved out (`rusqlite`'s
+//! `bundled-sqlcipher-vendored-openssl` feature), which needs a complete
+//! Perl for OpenSSL's `Configure` step. This was initially written
+//! against a dev environment whose only Perl (Git-for-Windows/MSYS) was
+//! missing `Locale::Maketext::Simple` — the exact gap
+//! `docs/phase1-architecture.md` §11 already documented — so the crate
+//! could not be compiled at first. Fixed for that session by installing
+//! a portable Strawberry Perl and putting it first on `PATH`; once done,
+//! this crate (and `parda-relay`, `parda-mixnode`'s dev-dependency on it,
+//! and `parda-cli`) all built and passed their full test suites with
+//! zero errors on the first successful compile — no logic bugs were
+//! found in this crate specifically. All 7 tests in
+//! `tests/client_store_tests.rs` pass. See
+//! `docs/phase3-3a-self-destruct-design.md` §12 for the full account,
+//! including why this is recorded rather than silently fixed: a
+//! from-scratch, first-try clean compile is worth noting precisely
+//! *because* this project's standard is not to claim correctness without
+//! a test that actually ran — this is that record.
+//!
+//! ## The structural boundary this module exists to enforce
+//!
+//! Per the brief: "anything flagged `self_destruct_at` or read-triggered
+//! must never be written to this store in the first place; persistence
+//! and destructibility are mutually exclusive per-message, and the
+//! store's write path must enforce that, not just the UI layer."
+//!
+//! [`LocalMessageStore::store_message`] checks
+//! `envelope.self_destruct_at.is_some() || envelope.read_triggered_destruct`
+//! and returns [`StoreError::RefusesSelfDestructingMessage`] — never
+//! silently drops the flag and persists anyway — before any SQL runs.
+//! There is no second code path into the `messages` table; every write
+//! goes through this one function. See
+//! `tests/client_store_tests.rs::test_self_destructing_messages_are_refused_time_bound`
+//! and `::test_self_destructing_messages_are_refused_read_triggered`.
+//!
+//! This enforcement is necessarily **advisory-input-dependent** in one
+//! sense worth being precise about: it trusts the caller's own local
+//! `MessageEnvelope` value (typically one this device itself just
+//! decrypted), not a value that traveled untrusted over the network
+//! post-decryption. That's an appropriate trust boundary — a message a
+//! device has already decrypted and is choosing to persist is squarely
+//! that device's own decision — but it's a different trust boundary than
+//! e.g. `MixTransport`'s, and conflating the two would be the same kind
+//! of "advisory vs. enforced" confusion `envelope.rs`'s own module docs
+//! already warn about for `self_destruct_at` on the wire.
+
+pub mod error;
+
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
+
+use parda_protocol::envelope::MessageEnvelope;
+use rusqlite::{params, Connection};
+
+pub use error::StoreError;
+
+pub type SharedLocalMessageStore = Arc<LocalMessageStore>;
+
+/// Fixed key used only by [`LocalMessageStore::open_ephemeral`]. Never
+/// used for a database file expected to persist real data — mirrors
+/// `server/src/store.rs`'s identical convention.
+const EPHEMERAL_TEST_KEY: &str = "parda-client-store-ephemeral-test-key-do-not-use-in-production";
+
+const CURRENT_SCHEMA_VERSION: i64 = 1;
+
+pub struct LocalMessageStore {
+    conn: Mutex<Connection>,
+}
+
+/// One row of persisted message history.
+#[derive(Debug, Clone)]
+pub struct StoredMessage {
+    pub id: String,
+    pub peer_address: String,
+    pub direction: MessageDirection,
+    pub envelope: MessageEnvelope,
+    pub stored_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageDirection {
+    Sent,
+    Received,
+}
+
+impl MessageDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            MessageDirection::Sent => "sent",
+            MessageDirection::Received => "received",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "sent" => Some(Self::Sent),
+            "received" => Some(Self::Received),
+            _ => None,
+        }
+    }
+}
+
+impl LocalMessageStore {
+    /// Open (or create) the store at `path`, encrypted with `key`.
+    /// Mirrors `server::store::RelayStore::open`'s SQLCipher sequencing
+    /// exactly (`PRAGMA key` must be the first statement executed — see
+    /// that module's docs for why) — deliberately not re-deriving that
+    /// logic differently here.
+    pub fn open(path: impl AsRef<std::path::Path>, key: &str) -> Result<SharedLocalMessageStore, StoreError> {
+        let conn = Connection::open(path).map_err(|e| StoreError::Sqlite(e.to_string()))?;
+        Self::from_connection(conn, key)
+    }
+
+    /// In-memory, ephemeral store for tests — nothing survives process
+    /// exit, fixed test-only key.
+    pub fn open_ephemeral() -> Result<SharedLocalMessageStore, StoreError> {
+        let conn = Connection::open_in_memory().map_err(|e| StoreError::Sqlite(e.to_string()))?;
+        Self::from_connection(conn, EPHEMERAL_TEST_KEY)
+    }
+
+    fn from_connection(conn: Connection, key: &str) -> Result<SharedLocalMessageStore, StoreError> {
+        conn.pragma_update(None, "key", key)
+            .map_err(|e| StoreError::Sqlite(format!("failed to set SQLCipher key: {e}")))?;
+
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))
+            .map_err(|e| {
+                StoreError::Sqlite(format!(
+                    "failed to unlock client store — wrong key, or not a SQLCipher database: {e}"
+                ))
+            })?;
+
+        run_migrations(&conn)?;
+
+        Ok(Arc::new(Self { conn: Mutex::new(conn) }))
+    }
+
+    /// Persist `envelope` (exchanged with `peer_address`, in `direction`)
+    /// to durable, encrypted-at-rest history.
+    ///
+    /// **Refuses** — does not persist, does not silently strip the flag
+    /// — any self-destructing envelope. See module docs.
+    pub async fn store_message(
+        &self,
+        peer_address: &str,
+        direction: MessageDirection,
+        envelope: &MessageEnvelope,
+    ) -> Result<String, StoreError> {
+        if envelope.self_destruct_at.is_some() || envelope.read_triggered_destruct {
+            return Err(StoreError::RefusesSelfDestructingMessage);
+        }
+
+        let id = local_row_id();
+        let envelope_json =
+            serde_json::to_string(envelope).map_err(|e| StoreError::Codec(e.to_string()))?;
+        let stored_at_ms = envelope.timestamp_ms;
+
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO messages (id, peer_address, direction, envelope_json, stored_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, peer_address, direction.as_str(), envelope_json, stored_at_ms as i64],
+        )
+        .map_err(|e| StoreError::Sqlite(e.to_string()))?;
+
+        Ok(id)
+    }
+
+    /// All persisted history with `peer_address`, oldest first.
+    pub async fn history_for(&self, peer_address: &str) -> Result<Vec<StoredMessage>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, peer_address, direction, envelope_json, stored_at_ms
+                 FROM messages WHERE peer_address = ?1 ORDER BY stored_at_ms ASC",
+            )
+            .map_err(|e| StoreError::Sqlite(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![peer_address], |row| {
+                let id: String = row.get(0)?;
+                let peer_address: String = row.get(1)?;
+                let direction: String = row.get(2)?;
+                let envelope_json: String = row.get(3)?;
+                let stored_at_ms: i64 = row.get(4)?;
+                Ok((id, peer_address, direction, envelope_json, stored_at_ms))
+            })
+            .map_err(|e| StoreError::Sqlite(e.to_string()))?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, peer_address, direction, envelope_json, stored_at_ms) =
+                row.map_err(|e| StoreError::Sqlite(e.to_string()))?;
+            let envelope: MessageEnvelope =
+                serde_json::from_str(&envelope_json).map_err(|e| StoreError::Codec(e.to_string()))?;
+            let direction = MessageDirection::from_str(&direction)
+                .ok_or_else(|| StoreError::Codec(format!("corrupt direction column: {direction:?}")))?;
+            out.push(StoredMessage {
+                id,
+                peer_address,
+                direction,
+                envelope,
+                stored_at_ms: stored_at_ms as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Delete all persisted history with `peer_address`. Intended to be
+    /// called alongside
+    /// `parda_protocol::session::SessionManager::burn_conversation`
+    /// (Sub-Phase 3D's other deliverable) so "burn this conversation"
+    /// clears *both* the live session state and any persisted history —
+    /// the two are separate calls (session-burn lives in `parda-protocol`,
+    /// which has no SQLCipher dependency and shouldn't gain one just for
+    /// this), not one hidden combined operation, but a caller wiring up
+    /// "burn" should call both.
+    pub async fn delete_history_for(&self, peer_address: &str) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn
+            .execute("DELETE FROM messages WHERE peer_address = ?1", params![peer_address])
+            .map_err(|e| StoreError::Sqlite(e.to_string()))?;
+        Ok(affected)
+    }
+
+    /// Total row count — test/diagnostic convenience.
+    pub async fn total_message_count(&self) -> Result<i64, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
+            .map_err(|e| StoreError::Sqlite(e.to_string()))
+    }
+}
+
+fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
+    let current: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|e| StoreError::Sqlite(e.to_string()))?;
+
+    if current < 1 {
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS messages (
+                id            TEXT PRIMARY KEY,
+                peer_address  TEXT NOT NULL,
+                direction     TEXT NOT NULL,
+                envelope_json TEXT NOT NULL,
+                stored_at_ms  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_messages_peer ON messages(peer_address);
+            ",
+        )
+        .map_err(|e| StoreError::Sqlite(e.to_string()))?;
+    }
+
+    if current < CURRENT_SCHEMA_VERSION {
+        conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
+            .map_err(|e| StoreError::Sqlite(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// A dependency-free local primary key: nanosecond timestamp plus a
+/// process-local monotonic counter. Never sent over the network or
+/// trusted as unpredictable — only used as a local SQLite primary key,
+/// so no need for the `uuid`/`rand` crates just for this.
+fn local_row_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}-{seq:x}")
+}

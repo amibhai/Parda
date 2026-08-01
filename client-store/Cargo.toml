@@ -1,0 +1,23 @@
+[package]
+name        = "parda-client-store"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+description = "PARDA client-side encrypted local message store (SQLCipher) — Sub-Phase 3D"
+
+# Same vendored-SQLCipher approach as parda-relay (server/src/store.rs) —
+# encrypted at rest, no system SQLCipher/OpenSSL install required. Carries
+# the same build prerequisite: a complete Perl for OpenSSL's Configure
+# step (docs/phase1-architecture.md §11). Verified buildable and tested —
+# see this crate's own module docs and
+# docs/phase3-3a-self-destruct-design.md §12.
+[dependencies]
+rusqlite       = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
+serde_json     = { workspace = true }
+thiserror      = { workspace = true }
+tracing        = { workspace = true }
+tokio          = { workspace = true, features = ["full"] }
+parda-protocol = { path = "../protocol" }
+
+[dev-dependencies]
+tokio-test = "0.4"
