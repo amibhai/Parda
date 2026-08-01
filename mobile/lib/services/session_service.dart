@@ -1,11 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
-import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:uuid/uuid.dart';
 
 import '../config/app_config.dart';
+import '../crypto/plaintext_handle.dart';
 import '../crypto/signal_bridge.dart';
 import '../models/message.dart';
 import 'api_service.dart';
@@ -21,7 +22,26 @@ import 'api_service.dart';
 ///
 /// All crypto operations delegate to [SignalBridge] (native platform code).
 /// This service never holds plaintext private key material.
-class SessionService extends ChangeNotifier {
+///
+/// ## Sub-Phase 4.5C: native plaintext handle lifecycle
+///
+/// A received message's decrypted content lives behind a native
+/// [PlaintextHandle], not a cached Dart `String` (see
+/// `models/message.dart`, `docs/phase4.5c-dart-plaintext-design.md`).
+/// Releasing (zeroizing) a handle the moment its chat bubble scrolls
+/// off-screen was considered and rejected: this app keeps no persistent
+/// message history (`Message.toJson`/`fromJson` don't exist — nothing
+/// backs a re-fetch), and the relay's `GET` is fetch-and-clear, so a
+/// released handle could never be repopulated — scrolling away and back
+/// within the same session would permanently lose that message, a real
+/// usability regression, not just a theoretical one. Instead,
+/// [SessionService] mixes in [WidgetsBindingObserver] and releases every
+/// outstanding handle when the app is backgrounded or terminated
+/// ([AppLifecycleState.paused]/[AppLifecycleState.detached]) — this
+/// still narrows the exposure window materially (from "as long as the
+/// process happens to stay alive, possibly hours" to "until the app
+/// leaves the foreground") without breaking in-session scroll-back.
+class SessionService extends ChangeNotifier with WidgetsBindingObserver {
   final SignalBridge _signal;
   final ApiService _api;
   final FlutterSecureStorage _secureStorage;
@@ -35,6 +55,10 @@ class SessionService extends ChangeNotifier {
   final Map<String, List<Message>> _messages = {};
   Map<String, List<Message>> get messages => Map.unmodifiable(_messages);
 
+  /// Every [PlaintextHandle] currently backing a received message's
+  /// content, released in bulk on backgrounding — see class docs.
+  final List<PlaintextHandle> _livePlaintextHandles = [];
+
   /// Active polling timer.
   Timer? _pollTimer;
 
@@ -44,7 +68,23 @@ class SessionService extends ChangeNotifier {
     FlutterSecureStorage? secureStorage,
   })  : _signal = signal ?? SignalBridge(),
         _api = api ?? ApiService(),
-        _secureStorage = secureStorage ?? const FlutterSecureStorage();
+        _secureStorage = secureStorage ?? const FlutterSecureStorage() {
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused || state == AppLifecycleState.detached) {
+      _releaseAllPlaintextHandles();
+    }
+  }
+
+  void _releaseAllPlaintextHandles() {
+    for (final handle in _livePlaintextHandles) {
+      handle.release();
+    }
+    _livePlaintextHandles.clear();
+  }
 
   // ── Enrollment ───────────────────────────────────────────────────────────
 
@@ -167,17 +207,20 @@ class SessionService extends ChangeNotifier {
       final senderId = envelopeJson['envelope']['sender_id'] as String? ??
           envelopeJson['sender_id'] as String;
 
-      // Decrypt via native Signal bridge (establishes session if PreKey message)
-      final plaintextBytes = await _signal.decryptMessage(
+      // Decrypt via native Signal bridge (establishes session if PreKey
+      // message). Sub-Phase 4.5C: this returns a native handle, not the
+      // decrypted bytes — see SignalBridge.decryptMessage's docs.
+      final handleId = await _signal.decryptMessage(
         envelopeJson['envelope'] as Map<String, dynamic>? ?? envelopeJson,
       );
-      final body = utf8.decode(plaintextBytes);
+      final handle = PlaintextHandle(handleId);
+      _livePlaintextHandles.add(handle);
 
       final msg = Message(
         id: envelopeJson['id'] as String? ?? _uuid.v4(),
         conversationId: senderId,
         senderId: senderId,
-        body: body,
+        plaintextHandleId: handleId,
         timestamp: DateTime.fromMillisecondsSinceEpoch(
           envelopeJson['envelope']?['timestamp_ms'] as int? ??
               DateTime.now().millisecondsSinceEpoch,
@@ -219,6 +262,8 @@ class SessionService extends ChangeNotifier {
   @override
   void dispose() {
     _pollTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    _releaseAllPlaintextHandles();
     super.dispose();
   }
 }

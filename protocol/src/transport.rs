@@ -12,19 +12,26 @@
 //! MixTransport:      SessionManager → MixTransport → Mix Network → Relay Server
 //! ```
 //!
-//! ## `MixTransport` receive-path scope
+//! ## `MixTransport` receive-path scope (Sub-Phase 4.5A)
 //!
-//! `MixTransport::receive` fetches from the relay exactly the way
-//! `DirectTransport` does — mix routing in this sub-phase anonymizes only
-//! the *send* path (which entry connection correlates with which envelope
-//! the relay ultimately receives). `recipient_id` is necessarily plaintext
-//! to the relay regardless (routing requires it — see
-//! `docs/THREAT_MODEL.md` §3.1/§3.5), so pulling messages by
-//! `recipient_id` doesn't leak anything beyond what's already documented
-//! as visible to the relay. Anonymizing the pull side too would need a
-//! Loopix-style provider/pull protocol — a materially separate feature,
-//! not attempted here. This boundary is deliberate, not an oversight; see
-//! `docs/THREAT_MODEL.md` §3.6.
+//! `MixTransport::receive` is now mix-routed too — see
+//! `docs/phase4.5a-receive-path-design.md` for the full design note. A
+//! two-leg protocol replaces the old direct `GET`: (1) a Sphinx-wrapped
+//! pull request, symmetric to `send`, carries `{recipient_id,
+//! rendezvous_token}` through the mix network to the relay's
+//! `POST /v1/pulls`; (2) a direct `GET /v1/pulls/{rendezvous_token}`
+//! retrieves whatever was staged — this leg reveals only an unlinkable
+//! random token to an observer, never `recipient_id`. `DirectTransport::receive`
+//! is unchanged — it never claimed anonymity, and still fetches via the
+//! plaintext `GET /v1/messages/{user_id}` path.
+//!
+//! **What this does not achieve, stated precisely (see the design note
+//! §3 for the full account):** leg 2 still reveals the client's own IP
+//! to the relay at the moment it retrieves its stage — the same class of
+//! residual gap already documented for sealed sender ("hides identity,
+//! not IP") and for `send` ("the client's own connection to the first
+//! mix hop is still visible"), not a new or worse one, but not full
+//! Loopix-style unlinkability either.
 //!
 //! ## Fail-closed
 //!
@@ -36,12 +43,13 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use rand::Rng;
 use serde::Deserialize;
 
 use crate::{
     envelope::MessageEnvelope,
     error::{PardaError, Result},
-    mixnet::{self, MixTopology},
+    mixnet::{self, MixTopology, PullRequest},
 };
 
 /// Matches `parda-relay`'s actual `GET /v1/messages/{user_id}` response
@@ -145,6 +153,16 @@ impl TransportLayer for DirectTransport {
 /// latency), not a value to hardcode past a sensible default.
 pub const DEFAULT_AVG_DELAY: Duration = Duration::from_millis(200);
 
+/// Sub-Phase 4.5A: how long `MixTransport::receive` waits between sending
+/// its pull request (leg 1) and retrieving the stage (leg 2), sampled
+/// uniformly from this range each call — a deliberately randomized,
+/// non-fixed gap so leg 1 and leg 2 don't share a trivially-constant
+/// offset an observer of both could key on. Not a strong decorrelation
+/// guarantee on its own (see design note §3) — a coarse, cheap mitigation
+/// layered on top of leg 1's own mix-network timing protection, not a
+/// substitute for it.
+pub const PULL_RETRIEVAL_DELAY_RANGE_MS: std::ops::Range<u64> = 50..300;
+
 /// Sends over a Sphinx mix network ([`crate::mixnet`]); receives directly
 /// from the relay. See module docs for the receive-path scope boundary
 /// and the fail-closed requirement on `send`.
@@ -222,10 +240,44 @@ impl TransportLayer for MixTransport {
         Ok(())
     }
 
+    /// Sub-Phase 4.5A two-leg mix-routed pull — see module docs and
+    /// `docs/phase4.5a-receive-path-design.md`. Fails closed the same
+    /// way `send` does: if leg 1 (the mix-routed pull request) can't
+    /// reach its first hop, this returns `Err` rather than falling back
+    /// to a direct, identity-leaking `GET /v1/messages/{recipient_id}`.
     async fn receive(&self, recipient_id: &str) -> Result<Vec<MessageEnvelope>> {
-        // See module docs "MixTransport receive-path scope" — intentionally
-        // identical to DirectTransport's fetch.
-        let url = format!("{}/v1/messages/{}", self.relay_base_url, recipient_id);
+        let request = PullRequest::new(recipient_id);
+        let request_bytes = serde_json::to_vec(&request)?;
+
+        let path = self.topology.choose_path(self.path_length)?;
+        let packet_bytes = mixnet::build_packet_to(
+            &request_bytes,
+            &path,
+            self.avg_delay,
+            self.payload_size,
+            mixnet::PULL_DESTINATION_TAG,
+        )?;
+
+        let first_hop = &path[0];
+        let url = format!("http://{}/mix/packet", first_hop.address);
+        self.http
+            .post(&url)
+            .body(packet_bytes)
+            .send()
+            .await
+            .map_err(|e| PardaError::Transport(format!("mix network first hop unreachable for pull request: {e}")))?
+            .error_for_status()
+            .map_err(|e| PardaError::Transport(format!("mix network first hop rejected pull request: {e}")))?;
+
+        // Leg 2: retrieve the stage. See module docs for exactly what
+        // this connection does and doesn't reveal.
+        let retrieval_delay_ms = rand::thread_rng().gen_range(PULL_RETRIEVAL_DELAY_RANGE_MS);
+        tokio::time::sleep(Duration::from_millis(retrieval_delay_ms)).await;
+
+        let url = format!(
+            "{}/v1/pulls/{}",
+            self.relay_base_url, request.rendezvous_token
+        );
         let response: FetchMessagesResponse = self
             .http
             .get(&url)

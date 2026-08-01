@@ -35,6 +35,9 @@ pub fn app(store: SharedRelayStore) -> Router {
         .route("/v1/messages/:user_id", get(routes::fetch_messages))
         .route("/v1/messages/:user_id", post(routes::submit_message))
         .route("/v1/messages/:user_id/:msg_id", delete(routes::delete_message))
+        // Sub-Phase 4.5A — see docs/phase4.5a-receive-path-design.md.
+        .route("/v1/pulls", post(routes::stage_pull))
+        .route("/v1/pulls/:rendezvous_token", get(routes::fetch_pull))
         .layer(TraceLayer::new_for_http())
         .layer(
             CorsLayer::new()

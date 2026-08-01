@@ -1,5 +1,5 @@
 [workspace]
-members  = ["protocol", "server", "mixnode", "gateway", "client-store", "cli", "mesh"]
+members  = ["protocol", "server", "mixnode", "gateway", "client-store", "cli", "mesh", "mobile-bridge", "tls"]
 resolver = "2"
 
 [workspace.package]

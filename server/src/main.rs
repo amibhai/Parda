@@ -54,21 +54,22 @@ async fn main() {
     // ── Bind & serve ───────────────────────────────────────────────────────
     let bind_addr = std::env::var("PARDA_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+    let addr: std::net::SocketAddr = bind_addr
+        .parse()
+        .unwrap_or_else(|e| panic!("PARDA_BIND is not a valid socket address ({bind_addr}): {e}"));
 
-    let listener = tokio::net::TcpListener::bind(&bind_addr)
-        .await
-        .unwrap_or_else(|e| panic!("Failed to bind to {bind_addr}: {e}"));
+    // Sub-Phase 4.5E. Resolved (and validated) before binding, so a
+    // half-configured TLS setup fails at startup rather than after the
+    // socket is already accepting connections — see `parda_tls`'s module
+    // docs, including why TLS is opt-in and what that costs by default.
+    let tls = parda_tls::TlsSettings::from_env()
+        .unwrap_or_else(|e| panic!("TLS configuration error: {e}"));
 
-    tracing::info!(
-        addr = %listener.local_addr().unwrap(),
-        "PARDA relay server listening"
-    );
+    tracing::info!(%addr, "PARDA relay server listening");
     tracing::warn!(
         "Sender metadata is hidden only for envelopes sent with sealed_sender = true. \
          Phase 1 peers, and any Phase 2 peer not opting in, remain visible to this relay."
     );
 
-    axum::serve(listener, app)
-        .await
-        .expect("server error");
+    parda_tls::serve(addr, app, &tls).await.expect("server error");
 }

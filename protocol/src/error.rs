@@ -79,6 +79,25 @@ pub enum PardaError {
     #[error("Self-destruct AEAD error: {0}")]
     SelfDestructCrypto(String),
 
+    /// A peer's identity key changed after it had been verified
+    /// out-of-band (Sub-Phase 4.5D). Deliberately distinct from
+    /// libsignal's generic `UntrustedIdentity` (surfaced through
+    /// [`PardaError::Signal`]): that fires for any pin mismatch, whereas
+    /// this one means specifically "a human compared this fingerprint
+    /// and confirmed it, and now it doesn't match" — a materially more
+    /// alarming condition that a caller should be able to distinguish
+    /// and present differently. Carries both fingerprints' display
+    /// digits so a UI can show what changed. See [`crate::trust`].
+    #[error(
+        "Identity key for peer {peer_id} changed after out-of-band verification: \
+         verified {verified_fingerprint}, now observing {observed_fingerprint}"
+    )]
+    IdentityKeyChangedAfterVerification {
+        peer_id: String,
+        verified_fingerprint: String,
+        observed_fingerprint: String,
+    },
+
     /// Catch-all for unexpected conditions.
     #[error("Internal error: {0}")]
     Internal(String),

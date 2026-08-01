@@ -28,6 +28,10 @@ reqwest     = { version = "0.12", default-features = false, features = ["json", 
 # protocol/src/mixnet.rs module docs.
 sphinx-packet = "0.7"
 x25519-dalek  = { version = "3.0", features = ["static_secrets", "getrandom", "zeroize"] }
+# Sub-Phase 4.5A: rendezvous-token encoding for mix-routed pull requests
+# (protocol/src/mixnet.rs::PullRequest) — text representation only, not a
+# cryptographic use.
+hex           = "0.4"
 # Phase 3 / Sub-Phase 3A: time-bound self-destruct key derivation and
 # encryption. HKDF (RFC 5869) + ChaCha20-Poly1305 AEAD — both RustCrypto,
 # no custom crypto. See docs/phase3-3a-self-destruct-design.md.

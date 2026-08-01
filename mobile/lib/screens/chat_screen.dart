@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
+import '../crypto/plaintext_handle.dart';
 import '../models/message.dart';
 import '../services/session_service.dart';
 
@@ -323,14 +324,45 @@ class _ChatScreenState extends State<ChatScreen> {
 
 // ─── Chat bubble widget ───────────────────────────────────────────────────────
 
-class _ChatBubble extends StatelessWidget {
+/// A [StatefulWidget], not [StatelessWidget], specifically so a received
+/// message's plaintext can be fetched once via [PlaintextHandle.renderCopy]
+/// in [initState] and cached in local widget state — see
+/// `SessionService`'s class docs (Sub-Phase 4.5C) for why the native
+/// handle itself lives longer than this widget, and `models/message.dart`
+/// for why sent messages skip this path entirely (their `body` is
+/// already a plain Dart `String`, never crossed a decrypt boundary).
+class _ChatBubble extends StatefulWidget {
   final Message message;
   final bool isMe;
 
   const _ChatBubble({required this.message, required this.isMe});
 
   @override
+  State<_ChatBubble> createState() => _ChatBubbleState();
+}
+
+class _ChatBubbleState extends State<_ChatBubble> {
+  String? _renderedBody;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.message.body != null) {
+      _renderedBody = widget.message.body;
+    } else {
+      final handleId = widget.message.plaintextHandleId;
+      if (handleId != null) {
+        PlaintextHandle(handleId).renderCopy().then((body) {
+          if (mounted) setState(() => _renderedBody = body);
+        });
+      }
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final message = widget.message;
+    final isMe = widget.isMe;
     return Align(
       alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
@@ -371,7 +403,7 @@ class _ChatBubble extends StatelessWidget {
               isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
           children: [
             Text(
-              message.body,
+              _renderedBody ?? '…',
               style: const TextStyle(color: Colors.white, fontSize: 15),
             ),
             const SizedBox(height: 4),

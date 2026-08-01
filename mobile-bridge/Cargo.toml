@@ -1,0 +1,33 @@
+[package]
+name        = "parda-mobile-bridge"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+description = "PARDA Rust<->JNI bridge for Android mesh radio (Sub-Phase 4.5B)"
+
+[lib]
+# cdylib for Android's `System.loadLibrary`; rlib too so this crate's own
+# tests (which don't need a JVM) can run as ordinary `cargo test`.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+tokio       = { workspace = true, features = ["full"] }
+async-trait = { workspace = true }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true }
+parda-mesh     = { path = "../mesh" }
+parda-protocol = { path = "../protocol" }
+# Official-adjacent, widely-used JNI bindings (docs.rs `jni`, jni-rs org) —
+# not hand-rolled unsafe FFI plumbing. See mobile-bridge/src/lib.rs module
+# docs for why a purpose-built minimal bridge was written on top of this
+# rather than adopting an existing higher-level Rust-Android-BLE crate
+# (`blew`/`ble-peripheral-rust` were found and considered, not assumed
+# absent).
+jni = "0.21"
+# Sub-Phase 4.5C: zero the transient JNI-boundary copy in
+# plaintext_exports.rs, same primitive already used throughout
+# parda-protocol — not a new dependency category for this workspace.
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"

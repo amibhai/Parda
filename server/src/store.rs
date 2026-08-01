@@ -53,6 +53,19 @@ const MAX_SENDER_CERT_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// database file that's expected to persist real data.
 const EPHEMERAL_TEST_KEY: &str = "parda-ephemeral-test-key-do-not-use-in-production";
 
+/// Sub-Phase 4.5A: how long a staged pull response waits for pickup
+/// before [`RelayStore::stage_pull`]'s opportunistic sweep discards it.
+/// Short by design — a rendezvous token that's never retrieved should
+/// not become a long-lived, growing side table.
+const PULL_STAGE_TTL_MS: u64 = 5 * 60 * 1000; // 5 minutes
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_millis() as u64
+}
+
 pub struct RelayStore {
     conn: Arc<Mutex<Connection>>,
     /// Sender-certificate authority. Generated fresh at process startup —
@@ -136,7 +149,7 @@ impl RelayStore {
 /// Applies schema migrations up to [`CURRENT_SCHEMA_VERSION`], tracked via
 /// `PRAGMA user_version`. Idempotent: running it against an already
 /// up-to-date database is a no-op.
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -156,6 +169,23 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
                 created_at_ms INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id);
+            ",
+        )?;
+    }
+
+    if current < 2 {
+        // Sub-Phase 4.5A: short-lived staging area for mix-routed pull
+        // requests — see docs/phase4.5a-receive-path-design.md. Keyed by
+        // an unlinkable random token, never by recipient_id, and swept
+        // on its own short TTL (PULL_STAGE_TTL_MS) rather than kept
+        // indefinitely; additive migration, existing tables untouched.
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS pull_stages (
+                rendezvous_token TEXT PRIMARY KEY,
+                messages_json    TEXT NOT NULL,
+                staged_at_ms     INTEGER NOT NULL
+            );
             ",
         )?;
     }
@@ -275,6 +305,72 @@ impl RelayStore {
             conn.execute("DELETE FROM messages WHERE recipient_id = ?1", params![user_id])
                 .expect("failed to clear drained messages");
             envelopes
+        })
+        .await
+        .expect("blocking task panicked")
+    }
+
+    /// Sub-Phase 4.5A: stage `recipient_id`'s current queue under
+    /// `rendezvous_token` for later pickup via [`Self::fetch_pull`],
+    /// instead of returning it directly. This is what a mix node's final
+    /// hop calls after unwrapping a `PULL_DESTINATION_TAG` packet — see
+    /// `docs/phase4.5a-receive-path-design.md`. Drains the persistent
+    /// queue exactly like [`Self::drain`] already does (same
+    /// fetch-and-clear semantics), then stores the result keyed only by
+    /// the unlinkable token. Also opportunistically sweeps stale
+    /// unclaimed stages older than [`PULL_STAGE_TTL_MS`] — a lightweight
+    /// TTL enforcement that doesn't need a separate background task.
+    pub async fn stage_pull(&self, recipient_id: String, rendezvous_token: String) {
+        let envelopes = self.drain(&recipient_id).await;
+        let conn = self.conn_handle();
+        tokio::task::spawn_blocking(move || {
+            let json =
+                serde_json::to_string(&envelopes).expect("Vec<StoredEnvelope> must serialise");
+            let now_ms = now_millis();
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "DELETE FROM pull_stages WHERE staged_at_ms < ?1",
+                params![now_ms.saturating_sub(PULL_STAGE_TTL_MS) as i64],
+            )
+            .expect("failed to sweep expired pull stages");
+            conn.execute(
+                "INSERT INTO pull_stages (rendezvous_token, messages_json, staged_at_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(rendezvous_token) DO UPDATE SET
+                     messages_json = excluded.messages_json,
+                     staged_at_ms = excluded.staged_at_ms",
+                params![rendezvous_token, json, now_ms as i64],
+            )
+            .expect("failed to stage pull response");
+        })
+        .await
+        .expect("blocking task panicked");
+    }
+
+    /// Sub-Phase 4.5A: fetch-and-clear whatever is staged under
+    /// `rendezvous_token`. Returns `None` if nothing is staged there
+    /// (already claimed, expired off the TTL sweep, or the token was
+    /// never valid) — the caller (`MixTransport::receive`) treats this
+    /// as "nothing new yet," not an error.
+    pub async fn fetch_pull(&self, rendezvous_token: &str) -> Option<Vec<StoredEnvelope>> {
+        let conn = self.conn_handle();
+        let rendezvous_token = rendezvous_token.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let json: Option<String> = conn
+                .query_row(
+                    "SELECT messages_json FROM pull_stages WHERE rendezvous_token = ?1",
+                    params![rendezvous_token],
+                    |row| row.get(0),
+                )
+                .optional()
+                .expect("failed to query staged pull");
+            conn.execute(
+                "DELETE FROM pull_stages WHERE rendezvous_token = ?1",
+                params![rendezvous_token],
+            )
+            .expect("failed to clear staged pull");
+            json.map(|j| serde_json::from_str(&j).expect("stored messages_json must deserialise"))
         })
         .await
         .expect("blocking task panicked")

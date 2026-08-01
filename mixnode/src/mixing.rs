@@ -8,7 +8,10 @@
 //! a "which packets shared a batch" correlation signal that Loopix's
 //! continuous-time, per-packet delay design specifically avoids.
 
-use parda_protocol::{envelope::MessageEnvelope, mixnet::UnwrapOutcome};
+use parda_protocol::{
+    envelope::MessageEnvelope,
+    mixnet::{PullRequest, UnwrapOutcome},
+};
 
 use crate::SharedMixNodeState;
 
@@ -37,6 +40,9 @@ pub fn schedule(state: SharedMixNodeState, outcome: UnwrapOutcome) {
             UnwrapOutcome::Deliver { envelope_bytes } => {
                 deliver(&state, envelope_bytes).await;
             }
+            UnwrapOutcome::PullRequest { request_bytes } => {
+                stage_pull(&state, request_bytes).await;
+            }
             UnwrapOutcome::DropCover => {
                 tracing::debug!("discarded drop-cover packet at its final hop");
             }
@@ -58,6 +64,34 @@ async fn forward(
         .await?
         .error_for_status()?;
     Ok(())
+}
+
+/// Sub-Phase 4.5A: final-hop handling for a `PULL_DESTINATION_TAG`
+/// packet — POST the decoded [`PullRequest`] to the relay's `/v1/pulls`
+/// staging endpoint instead of delivering an envelope. See
+/// `docs/phase4.5a-receive-path-design.md`. Same fire-and-forget shape
+/// as [`deliver`] — this node never learns or needs to know whether the
+/// client ever actually retrieves what gets staged.
+async fn stage_pull(state: &SharedMixNodeState, request_bytes: Vec<u8>) {
+    let request: PullRequest = match serde_json::from_slice(&request_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "final-hop payload did not deserialise as a PullRequest — dropping"
+            );
+            return;
+        }
+    };
+    let url = format!("{}/v1/pulls", state.relay_base_url);
+    match state.http.post(&url).json(&request).send().await {
+        Ok(resp) => {
+            if let Err(e) = resp.error_for_status() {
+                tracing::warn!(error = %e, "relay rejected mix-routed pull request");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "failed to reach relay for mix-routed pull request"),
+    }
 }
 
 async fn deliver(state: &SharedMixNodeState, envelope_bytes: Vec<u8>) {

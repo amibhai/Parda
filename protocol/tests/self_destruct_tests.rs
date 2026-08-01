@@ -229,3 +229,118 @@ async fn test_read_triggered_concurrent_opens_only_one_succeeds() {
     assert_eq!(failures, RACERS - 1);
     assert!(message.is_expired());
 }
+
+// ─── Sub-Phase 4.5E: combined "by T or on read, whichever comes first" ───────
+
+/// The read wins the race: opening well before the timer's deadline must
+/// erase immediately, *without* waiting for T.
+#[tokio::test]
+async fn test_combined_mode_read_erases_before_the_timer_would_have() {
+    let message = SelfDestructingMessage::seal_combined(
+        b"combined: read first",
+        1_753_900_000_000,
+        Duration::from_secs(3600), // deliberately far away
+    )
+    .unwrap();
+
+    let plaintext = message.open().expect("first open must succeed");
+    assert_eq!(&plaintext[..], b"combined: read first");
+
+    assert!(
+        message.is_expired(),
+        "a combined-mode message must be erased by its first read, not left alive until T"
+    );
+    assert!(
+        matches!(message.open(), Err(PardaError::SelfDestructExpired)),
+        "a second read must fail closed"
+    );
+}
+
+/// The timer wins the race: a combined-mode message that is *never* read
+/// must still be gone by T. This is the half `seal_read_triggered` alone
+/// does not provide (an unread read-triggered message stays readable
+/// indefinitely, by documented design) — so this test is what
+/// distinguishes `Combined` from `ReadTriggered`, not a duplicate of the
+/// existing timer test.
+#[tokio::test]
+async fn test_combined_mode_timer_erases_a_message_that_is_never_read() {
+    let message = SelfDestructingMessage::seal_combined(
+        b"combined: never read",
+        1_753_900_000_000,
+        Duration::from_millis(50),
+    )
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    assert!(message.is_expired(), "the combined-mode timer did not fire");
+    assert!(
+        matches!(message.open(), Err(PardaError::SelfDestructExpired)),
+        "open() must fail closed once the timer has fired"
+    );
+}
+
+/// Both mechanisms firing must be harmless — the timer landing on an
+/// already-read-erased message is a no-op, not a panic or a double-free.
+/// This is the concrete check behind `seal_combined`'s claim that the
+/// race "needs no coordination because erase is idempotent".
+#[tokio::test]
+async fn test_combined_mode_timer_firing_after_a_read_is_a_harmless_no_op() {
+    let message = SelfDestructingMessage::seal_combined(
+        b"combined: both fire",
+        1_753_900_000_000,
+        Duration::from_millis(50),
+    )
+    .unwrap();
+
+    message.open().expect("read before the timer");
+    assert!(message.is_expired());
+
+    // Let the timer fire on the already-erased key.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    assert!(message.is_expired());
+    assert!(matches!(message.open(), Err(PardaError::SelfDestructExpired)));
+}
+
+/// Concurrent readers of a combined-mode message must behave exactly as
+/// they do for read-triggered: exactly one winner. Mirrors
+/// `test_read_triggered_concurrent_opens_only_one_succeeds`, since
+/// `Combined` takes the same erase-inside-the-decrypt-lock path and that
+/// atomicity claim now covers a second mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_combined_mode_concurrent_opens_only_one_succeeds() {
+    const RACERS: usize = 32;
+
+    let message = SelfDestructingMessage::seal_combined(
+        b"combined: one winner",
+        1000,
+        Duration::from_secs(3600),
+    )
+    .unwrap();
+    let barrier = Arc::new(Barrier::new(RACERS));
+
+    let mut tasks = Vec::with_capacity(RACERS);
+    for _ in 0..RACERS {
+        let message = message.clone();
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            message.open()
+        }));
+    }
+
+    let mut successes = 0;
+    for task in tasks {
+        match task.await.expect("racer task panicked") {
+            Ok(plaintext) => {
+                assert_eq!(&plaintext[..], b"combined: one winner");
+                successes += 1;
+            }
+            Err(PardaError::SelfDestructExpired) => {}
+            Err(other) => panic!("unexpected error from a racing open(): {other}"),
+        }
+    }
+
+    assert_eq!(successes, 1, "exactly one concurrent open() must succeed, got {successes}");
+}

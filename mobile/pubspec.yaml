@@ -46,5 +46,9 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
-  assets:
-    - assets/images/
+  # `assets/images/` was declared here but the directory never existed
+  # and nothing in lib/ loads anything from it (checked, not assumed) —
+  # a real build failure (`mergeDebugAssets`), not just an analyzer
+  # warning, found while scaffolding the Android platform in Sub-Phase
+  # 4.5B. Removed rather than papered over with an empty placeholder
+  # directory implying intent that doesn't exist.

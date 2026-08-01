@@ -20,6 +20,9 @@ rand           = "0.8"
 # protocol/src/mixnet.rs. A mix node deliberately does not depend on
 # sphinx-packet directly; it goes through parda_protocol::mixnet only.
 parda-protocol = { path = "../protocol" }
+# Sub-Phase 4.5E: optional rustls TLS termination, shared with
+# parda-relay. See tls/src/lib.rs module docs.
+parda-tls      = { path = "../tls" }
 
 [dev-dependencies]
 tokio         = { workspace = true, features = ["full"] }

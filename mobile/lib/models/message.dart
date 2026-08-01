@@ -1,11 +1,25 @@
-import 'dart:convert';
-
-/// Represents a decrypted, locally-stored message.
+/// Represents a locally-held message — either composed locally (sent)
+/// or decrypted from the relay (received).
+///
+/// Exactly one of [body] / [plaintextHandleId] is set, never both:
+///
+/// - **Sent** messages carry [body] directly. This text originated as a
+///   Dart `String` typed into the compose field — it never crossed a
+///   native-decrypt boundary, so the Sub-Phase 4.5C concern below
+///   doesn't apply to it the same way (see
+///   `docs/phase4.5c-dart-plaintext-design.md` §2).
+/// - **Received** messages carry [plaintextHandleId] instead: an opaque
+///   handle into a native, zeroize-on-release buffer
+///   (`PlaintextBridge.kt` / `protocol::plaintext_ffi`). Rendering code
+///   must go through `PlaintextHandle(plaintextHandleId).renderCopy()`
+///   (see `crypto/plaintext_handle.dart`), not read a cached `String` —
+///   this class deliberately never holds one for received content.
 class Message {
   final String id;
   final String conversationId; // typically the remote user ID
   final String senderId;
-  final String body;
+  final String? body;
+  final int? plaintextHandleId;
   final DateTime timestamp;
   final MessageStatus status;
 
@@ -13,10 +27,14 @@ class Message {
     required this.id,
     required this.conversationId,
     required this.senderId,
-    required this.body,
+    this.body,
+    this.plaintextHandleId,
     required this.timestamp,
     required this.status,
-  });
+  }) : assert(
+          (body == null) != (plaintextHandleId == null),
+          'exactly one of body / plaintextHandleId must be set',
+        );
 
   bool get isOutgoing => status == MessageStatus.sent ||
       status == MessageStatus.delivered ||
@@ -27,26 +45,9 @@ class Message {
         conversationId: conversationId,
         senderId: senderId,
         body: body,
+        plaintextHandleId: plaintextHandleId,
         timestamp: timestamp,
         status: status ?? this.status,
-      );
-
-  Map<String, dynamic> toJson() => {
-        'id': id,
-        'conversationId': conversationId,
-        'senderId': senderId,
-        'body': body,
-        'timestamp': timestamp.millisecondsSinceEpoch,
-        'status': status.name,
-      };
-
-  factory Message.fromJson(Map<String, dynamic> json) => Message(
-        id: json['id'] as String,
-        conversationId: json['conversationId'] as String,
-        senderId: json['senderId'] as String,
-        body: json['body'] as String,
-        timestamp: DateTime.fromMillisecondsSinceEpoch(json['timestamp'] as int),
-        status: MessageStatus.values.byName(json['status'] as String),
       );
 }
 

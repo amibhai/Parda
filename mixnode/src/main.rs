@@ -49,19 +49,25 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(500);
     let peers = parse_peers(&std::env::var("MIXNODE_PEERS").unwrap_or_default());
-    cover_traffic::spawn(state.clone(), peers, Duration::from_millis(cover_interval_ms));
+    cover_traffic::spawn(state.clone(), peers.clone(), Duration::from_millis(cover_interval_ms));
+    // Sub-Phase 4.5A — see cover_traffic module docs.
+    cover_traffic::spawn_pull_cover(state.clone(), peers, Duration::from_millis(cover_interval_ms));
 
     let bind_addr = std::env::var("MIXNODE_BIND").unwrap_or_else(|_| "127.0.0.1:9001".to_string());
-    let listener = tokio::net::TcpListener::bind(&bind_addr)
+    let addr: std::net::SocketAddr = bind_addr
+        .parse()
+        .unwrap_or_else(|e| panic!("MIXNODE_BIND is not a valid socket address ({bind_addr}): {e}"));
+
+    // Sub-Phase 4.5E — same TLS module and same opt-in posture as
+    // parda-relay; see tls/src/lib.rs module docs.
+    let tls = parda_tls::TlsSettings::from_env()
+        .unwrap_or_else(|e| panic!("TLS configuration error: {e}"));
+
+    tracing::info!(%addr, "parda-mixnode listening");
+
+    parda_tls::serve(addr, app(state), &tls)
         .await
-        .unwrap_or_else(|e| panic!("failed to bind to {bind_addr}: {e}"));
-
-    tracing::info!(
-        addr = %listener.local_addr().unwrap(),
-        "parda-mixnode listening"
-    );
-
-    axum::serve(listener, app(state)).await.expect("mix node server error");
+        .expect("mix node server error");
 }
 
 fn parse_peers(raw: &str) -> Vec<MixNodeDescriptor> {

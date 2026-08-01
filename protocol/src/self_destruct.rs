@@ -26,7 +26,7 @@
 //! `protocol/tests/forensic_recovery_tests.rs` for the end-to-end
 //! adversarial test that exercises all of this together.
 //!
-//! **The two destruct modes' guarantees must not blur together:**
+//! **The destruct modes' guarantees must not blur together:**
 //! [`DestructMode::TimeBound`] means "gone by T regardless of whether it
 //! was ever read" — [`SelfDestructingMessage::seal`], a monotonic timer,
 //! no read dependency. [`DestructMode::ReadTriggered`] means "gone after
@@ -34,10 +34,12 @@
 //! no timer at all, erasure happens *inside* the same critical section
 //! as the first successful decrypt. A read-triggered message that is
 //! never read stays readable indefinitely; that is the documented,
-//! intended behavior of choosing this mode, not an oversight — a caller
-//! wanting "whichever comes first" would need to combine both modes
-//! explicitly (not implemented here, to keep each mode's guarantee
-//! legible on its own).
+//! intended behavior of choosing this mode, not an oversight.
+//! [`DestructMode::Combined`] (Sub-Phase 4.5E,
+//! [`SelfDestructingMessage::seal_combined`]) is "gone by T **or** on
+//! first read, whichever comes first" — both mechanisms armed at once,
+//! no third primitive introduced, and strictly stronger than either
+//! alone rather than a compromise between them.
 //!
 //! ## Read-triggered atomicity (Sub-Phase 3B)
 //!
@@ -84,11 +86,25 @@ const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
 
 /// Which guarantee a self-destructing message carries. See module docs
-/// for why the two modes must not be conflated.
+/// for why these modes must not be conflated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DestructMode {
     TimeBound,
     ReadTriggered,
+    /// "Gone by T **or** on first read, whichever comes first"
+    /// (Sub-Phase 4.5E). Not a new primitive: both existing mechanisms
+    /// are armed at once — the same monotonic-anchored timer
+    /// [`DestructMode::TimeBound`] uses, plus the same
+    /// erase-inside-the-decrypt-critical-section
+    /// [`DestructMode::ReadTriggered`] uses — and `erase()` is
+    /// idempotent, so whichever fires first simply wins and the other
+    /// becomes a no-op. See [`SelfDestructingMessage::seal_combined`].
+    ///
+    /// This mode's guarantee is the **conjunction** of the other two
+    /// (gone by T, *and* gone after a read), which makes it strictly
+    /// stronger than either — worth stating plainly, because "combined"
+    /// could otherwise be misread as a weaker best-of-both compromise.
+    Combined,
 }
 
 impl DestructMode {
@@ -96,7 +112,14 @@ impl DestructMode {
         match self {
             DestructMode::TimeBound => 0,
             DestructMode::ReadTriggered => 1,
+            DestructMode::Combined => 2,
         }
+    }
+
+    /// Whether a successful [`SelfDestructingMessage::open`] must erase
+    /// the key as part of the same critical section.
+    fn erases_on_read(self) -> bool {
+        matches!(self, DestructMode::ReadTriggered | DestructMode::Combined)
     }
 }
 
@@ -220,6 +243,151 @@ pub struct SelfDestructingMessage {
     ciphertext: Arc<Vec<u8>>,
     key: Arc<Mutex<Option<DerivedKey>>>,
     mode: DestructMode,
+    /// Absolute wall-clock deadline, for [`SelfDestructingMessage::export_for_persistence`]
+    /// only (Sub-Phase 4.5E). `None` for [`DestructMode::ReadTriggered`],
+    /// which has no timer at all.
+    ///
+    /// **The live in-process timer does not use this** — it stays
+    /// anchored to a monotonic [`TokioInstant`], exactly as before, so
+    /// nothing about wall-clock trust changes for a running process.
+    /// This field exists solely because a *restart* has no monotonic
+    /// reference point to carry across, and is only ever consulted
+    /// through [`SelfDestructingMessage::restore`], which guards it with
+    /// [`crate::clock_guard`].
+    expires_at_ms: Option<u64>,
+}
+
+/// The complete sealed state of a [`SelfDestructingMessage`], for
+/// persisting across a process restart (Sub-Phase 4.5E).
+///
+/// ## Why this type exists at all — the constraint that forces it
+///
+/// A message cannot simply be re-derived from its original wire
+/// envelope after a restart: the one-time Double-Ratchet decrypt that
+/// produced its plaintext already consumed that ratchet step, and
+/// forward secrecy deleted the step-key on first use. There is nothing
+/// left to redo. So what has to survive is the *already-sealed* state —
+/// which necessarily includes the derived key, because the AEAD
+/// ciphertext alone is unopenable by design.
+///
+/// ## The trade-off, stated plainly rather than folded into the
+/// existing guarantee's language
+///
+/// Sub-Phase 3A's self-destruct key is **memory-only and never touches
+/// disk**. A message persisted through this type breaks exactly that
+/// property: its derived key is written to storage. It is written into
+/// `parda-client-store`'s SQLCipher database — encrypted at rest, the
+/// same trust boundary every other thing that store holds already sits
+/// behind, never weaker — but "encrypted at rest under a key the device
+/// also holds" is categorically not the same claim as "never persisted."
+/// An adversary who compromises the client-store key and images the disk
+/// during the message's live window recovers the plaintext; against the
+/// unpersisted primitive, they would have needed to image *volatile
+/// memory* in that window instead.
+///
+/// **This is therefore opt-in per message, never automatic.** Nothing in
+/// [`SelfDestructingMessage`] calls this; a caller has to choose it,
+/// having read this. See `docs/THREAT_MODEL.md` and the README's Status
+/// & Limitations table, which state the same thing in the same terms.
+pub struct PersistedSelfDestructState {
+    ciphertext: Vec<u8>,
+    /// The derived key. `Zeroizing` so this struct's own copy is
+    /// overwritten when dropped — the persisted copy on disk is the
+    /// caller's responsibility to delete, which
+    /// `parda-client-store`'s holding area does by deleting the row
+    /// outright rather than marking it.
+    key_bytes: Zeroizing<[u8; KEY_LEN]>,
+    mode: DestructMode,
+    expires_at_ms: Option<u64>,
+}
+
+impl PersistedSelfDestructState {
+    pub fn ciphertext(&self) -> &[u8] {
+        &self.ciphertext
+    }
+
+    /// The derived key bytes — **the sensitive half of this struct**.
+    /// Exposed because a persistence layer has to write them somewhere;
+    /// see the type's docs for what accepting that costs.
+    pub fn key_bytes(&self) -> &[u8; KEY_LEN] {
+        &self.key_bytes
+    }
+
+    pub fn mode(&self) -> DestructMode {
+        self.mode
+    }
+
+    /// Absolute wall-clock expiry deadline, or `None` for a pure
+    /// read-triggered message (which has no deadline by design).
+    pub fn expires_at_ms(&self) -> Option<u64> {
+        self.expires_at_ms
+    }
+
+    /// Rebuild from previously-persisted parts. Used by a storage layer
+    /// reading a row back; the values must be exactly those the
+    /// accessors above returned.
+    pub fn from_parts(
+        ciphertext: Vec<u8>,
+        key_bytes: [u8; KEY_LEN],
+        mode: DestructMode,
+        expires_at_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            ciphertext,
+            key_bytes: Zeroizing::new(key_bytes),
+            mode,
+            expires_at_ms,
+        }
+    }
+}
+
+/// Deliberately **not** `#[derive(Debug)]`, for the same reason
+/// `session::SealedSenderPlaintext` isn't: this type reaches the derived
+/// key, and a derived impl would print it from any `{:?}` — a log line,
+/// a panic message, an `expect_err` in a test. This impl exposes only
+/// non-secret metadata. Added in Sub-Phase 4.5E because the
+/// restart-survival tests needed a `Debug` bound; written this way so
+/// that reaching for `Debug` here can never become the thing that leaks
+/// a key.
+impl std::fmt::Debug for SelfDestructingMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelfDestructingMessage")
+            .field("mode", &self.mode)
+            .field("expired", &self.is_expired())
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field(
+                "ciphertext",
+                &format_args!("<{} bytes>", self.ciphertext.len()),
+            )
+            .finish()
+    }
+}
+
+/// Same redaction discipline as [`SelfDestructingMessage`]'s impl above
+/// — this type exists to carry the derived key to a storage layer, so a
+/// derived `Debug` would be the most direct possible way to leak it.
+impl std::fmt::Debug for PersistedSelfDestructState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersistedSelfDestructState")
+            .field("mode", &self.mode)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field(
+                "ciphertext",
+                &format_args!("<{} bytes>", self.ciphertext.len()),
+            )
+            .field("key_bytes", &format_args!("<{KEY_LEN} bytes redacted>"))
+            .finish()
+    }
+}
+
+/// Current wall-clock time in milliseconds. Used only to compute the
+/// *persisted* deadline (see [`SelfDestructingMessage::expires_at_ms`]);
+/// the live timer never reads this.
+fn wall_clock_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl SelfDestructingMessage {
@@ -256,6 +424,33 @@ impl SelfDestructingMessage {
         Self::seal_inner(plaintext, DestructMode::ReadTriggered, timestamp_ms, 0)
     }
 
+    /// Encrypt `plaintext` with **both** mechanisms armed: gone by
+    /// `timestamp_ms + expiry_window`, *or* on first successful
+    /// [`Self::open`], whichever comes first (Sub-Phase 4.5E).
+    ///
+    /// Composition of the two existing mechanisms, not a third one — see
+    /// [`DestructMode::Combined`]. Concretely: this arms the identical
+    /// timer [`Self::seal`] arms and takes the identical
+    /// erase-inside-the-decrypt-lock path [`Self::seal_read_triggered`]
+    /// takes. The race between them needs no coordination because
+    /// [`erase`] is idempotent and both paths run under the same
+    /// `Mutex` — whichever wins, the loser finds `None` and does
+    /// nothing. `tests::test_combined_mode_*` cover both orderings.
+    pub fn seal_combined(
+        plaintext: &[u8],
+        timestamp_ms: u64,
+        expiry_window: Duration,
+    ) -> Result<Self> {
+        let message = Self::seal_inner(
+            plaintext,
+            DestructMode::Combined,
+            timestamp_ms,
+            expiry_window.as_millis() as u64,
+        )?;
+        message.spawn_expiry_timer(expiry_window);
+        Ok(message)
+    }
+
     fn seal_inner(
         plaintext: &[u8],
         mode: DestructMode,
@@ -284,6 +479,16 @@ impl SelfDestructingMessage {
             ciphertext: Arc::new(stored),
             key: Arc::new(Mutex::new(Some(key))),
             mode,
+            // Recorded from the wall clock at seal time so a *restart*
+            // has a reference point to compare against. The live timer
+            // below still uses a monotonic instant and never reads this
+            // — see the field's own docs.
+            expires_at_ms: match mode {
+                DestructMode::ReadTriggered => None,
+                DestructMode::TimeBound | DestructMode::Combined => {
+                    Some(wall_clock_now_ms().saturating_add(expiry_window_ms))
+                }
+            },
         })
     }
 
@@ -316,12 +521,14 @@ impl SelfDestructingMessage {
     /// Returns [`PardaError::SelfDestructExpired`] otherwise — fails
     /// closed rather than returning a default/empty value.
     ///
-    /// For a [`DestructMode::ReadTriggered`] message, this call *is* the
-    /// trigger: decrypt and erase happen inside one held lock, so the
-    /// key is already gone by the time this function returns anything
-    /// to the caller — see module docs "Read-triggered atomicity". For
+    /// For [`DestructMode::ReadTriggered`] and
+    /// [`DestructMode::Combined`], this call *is* the trigger: decrypt
+    /// and erase happen inside one held lock, so the key is already gone
+    /// by the time this function returns anything to the caller — see
+    /// module docs "Read-triggered atomicity". For
     /// [`DestructMode::TimeBound`], this only reads; erasure is the
-    /// timer's job.
+    /// timer's job. (`Combined` additionally has the timer armed, so it
+    /// expires on schedule even if never opened.)
     pub fn open(&self) -> Result<Zeroizing<Vec<u8>>> {
         let mut guard = self.key.lock().unwrap();
 
@@ -343,7 +550,7 @@ impl SelfDestructingMessage {
                 .map_err(|e| PardaError::SelfDestructCrypto(e.to_string()))?
         };
 
-        if self.mode == DestructMode::ReadTriggered {
+        if self.mode.erases_on_read() {
             // Still holding `guard` — no other caller can be mid-`open()`
             // on this message right now. Erase before releasing the
             // lock, so there is no window in which this decrypt
@@ -383,6 +590,97 @@ impl SelfDestructingMessage {
             });
         }
         self.open()
+    }
+
+    /// Export this message's complete sealed state so it can survive a
+    /// process restart (Sub-Phase 4.5E).
+    ///
+    /// **Read [`PersistedSelfDestructState`]'s docs before calling
+    /// this.** It copies the derived key out of locked memory so a
+    /// storage layer can write it down — a real, documented weakening of
+    /// Sub-Phase 3A's "the key never touches disk" property, opt-in per
+    /// message and never invoked automatically by this module.
+    ///
+    /// Fails with [`PardaError::SelfDestructExpired`] if the key is
+    /// already gone — an expired message must not be resurrectible, and
+    /// exporting one would write a useless (but still key-shaped) row.
+    pub fn export_for_persistence(&self) -> Result<PersistedSelfDestructState> {
+        let guard = self.key.lock().unwrap();
+        let key = guard.as_ref().ok_or(PardaError::SelfDestructExpired)?;
+        Ok(PersistedSelfDestructState {
+            ciphertext: self.ciphertext.as_ref().clone(),
+            key_bytes: Zeroizing::new(*key.0),
+            mode: self.mode,
+            expires_at_ms: self.expires_at_ms,
+        })
+    }
+
+    /// Rebuild a message from persisted state after a restart, re-arming
+    /// whichever mechanisms its mode calls for (Sub-Phase 4.5E).
+    ///
+    /// **Fails closed in two distinct ways, both deliberate:**
+    ///
+    /// 1. **Clock rollback** → [`PardaError::ClockRollbackDetected`].
+    ///    A restart is precisely the window
+    ///    [`crate::clock_guard`] exists to cover: the monotonic anchor
+    ///    the live timer used is gone, so the only remaining reference is
+    ///    the wall clock, which an adversary holding the device can move.
+    ///    A rolled-back clock must not be allowed to resurrect a message
+    ///    whose deadline has really passed, so this refuses rather than
+    ///    trusting it. The key is *never placed in a live message* in
+    ///    this case — it stays in the caller's `state` and is zeroized
+    ///    when that drops.
+    /// 2. **Deadline already passed** →
+    ///    [`PardaError::SelfDestructExpired`]. The message expired while
+    ///    the process was down; restoring it would be exactly the failure
+    ///    this whole sub-phase exists to prevent.
+    ///
+    /// On success the expiry timer is re-armed for the *remaining*
+    /// window (`expires_at_ms - now_ms`), not the original full window —
+    /// downtime counts against the message's life, which is what "gone
+    /// by T" has to mean for the guarantee to survive a restart at all.
+    pub fn restore(
+        state: &PersistedSelfDestructState,
+        clock_store: &dyn ClockWatermarkStore,
+        now_ms: u64,
+    ) -> Result<Self> {
+        if let ClockCheck::RollbackDetected {
+            watermark_ms,
+            observed_ms,
+        } = check_clock_integrity(clock_store, now_ms)
+        {
+            return Err(PardaError::ClockRollbackDetected {
+                observed_ms,
+                watermark_ms,
+            });
+        }
+
+        let remaining = match state.expires_at_ms {
+            Some(deadline) => {
+                if now_ms >= deadline {
+                    return Err(PardaError::SelfDestructExpired);
+                }
+                Some(Duration::from_millis(deadline - now_ms))
+            }
+            // Pure read-triggered: no deadline, nothing to check.
+            None => None,
+        };
+
+        let mut key_bytes: Box<[u8; KEY_LEN]> = Box::new([0u8; KEY_LEN]);
+        key_bytes.copy_from_slice(state.key_bytes.as_ref());
+
+        let message = Self {
+            ciphertext: Arc::new(state.ciphertext.clone()),
+            key: Arc::new(Mutex::new(Some(DerivedKey::new(key_bytes)))),
+            mode: state.mode,
+            expires_at_ms: state.expires_at_ms,
+        };
+
+        if let Some(remaining) = remaining {
+            message.spawn_expiry_timer(remaining);
+        }
+
+        Ok(message)
     }
 }
 

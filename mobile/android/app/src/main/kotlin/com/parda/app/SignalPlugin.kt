@@ -13,9 +13,9 @@ import org.signal.libsignal.protocol.ecc.Curve
 import org.signal.libsignal.protocol.groups.GroupSessionBuilder
 import org.signal.libsignal.protocol.state.*
 import org.signal.libsignal.protocol.state.impl.InMemorySignalProtocolStore
-import org.signal.libsignal.protocol.util.KeyHelper
 import java.security.KeyStore
 import android.util.Base64
+import org.signal.libsignal.protocol.message.CiphertextMessage
 import org.signal.libsignal.protocol.message.PreKeySignalMessage
 import org.signal.libsignal.protocol.message.SignalMessage
 
@@ -34,7 +34,9 @@ import org.signal.libsignal.protocol.message.SignalMessage
  * - getPreKeyBundle() → Map
  * - processPreKeyBundle(remoteUserId: String, bundle: Map) → void
  * - encryptMessage(remoteUserId: String, plaintext: ByteArray) → Map
- * - decryptMessage(envelope: Map) → ByteArray
+ * - decryptMessage(envelope: Map) → Long (a `PlaintextBridge` native handle,
+ *   Sub-Phase 4.5C — never the raw decrypted bytes; see `PlaintextBridge.kt`
+ *   and `mobile/lib/crypto/plaintext_handle.dart`)
  * - hasSession(remoteUserId: String) → Boolean
  */
 class SignalPlugin : FlutterPlugin, MethodCallHandler {
@@ -103,8 +105,18 @@ class SignalPlugin : FlutterPlugin, MethodCallHandler {
             signedPreKeySig
         )
 
-        // Generate one-time prekeys
-        val preKeys = KeyHelper.generatePreKeys(0, 100)
+        // Generate one-time prekeys. `KeyHelper.generatePreKeys(start, count)`
+        // — what this was originally written against — does not exist in
+        // the current libsignal-android API (confirmed by reading
+        // KeyHelper.java at the exact git tag this project's Rust
+        // `libsignal-protocol` dependency is already pinned to, v0.66.0:
+        // it has only `generateRegistrationId`). A pre-existing defect in
+        // this file, invisible until Sub-Phase 4.5B's real Gradle build —
+        // no prior session had a toolchain to compile this against.
+        // Replaced with the equivalent construction using primitives that
+        // do exist (`Curve.generateKeyPair`, `PreKeyRecord`'s real
+        // `(id, keyPair)` constructor).
+        val preKeys = (0 until 100).map { id -> PreKeyRecord(id, Curve.generateKeyPair()) }
 
         // Initialise in-memory store
         protocolStore = InMemorySignalProtocolStore(
@@ -229,21 +241,32 @@ class SignalPlugin : FlutterPlugin, MethodCallHandler {
             else       -> sessionCipher.decrypt(SignalMessage(ciphertextBytes))
         }
         try {
-            result.success(plaintext)
+            // Sub-Phase 4.5C fix, replacing the previous `result.success(plaintext)`:
+            // the finding in docs/phase3-3a-self-destruct-design.md §9 and
+            // docs/phase4.5c-dart-plaintext-design.md §1 is that once raw
+            // decrypted bytes cross the MethodChannel into Dart, nothing on
+            // this side of the boundary can make them provably erasable —
+            // Dart's `String` has no mutable backing storage. Handing Dart
+            // an opaque native handle instead (backed by
+            // `parda_protocol::plaintext_ffi::PlaintextHandle`, the same
+            // zeroize/lock discipline already audited for
+            // `self_destruct::DerivedKey`) means the *decrypted content
+            // itself* never crosses this MethodChannel call at all — only
+            // a handle ID does. See `PlaintextBridge.kt` and
+            // `mobile/lib/crypto/plaintext_handle.dart`.
+            val handle = PlaintextBridge.nativePlaintextNew(plaintext)
+            if (handle == 0L) {
+                result.error("PLAINTEXT_HANDLE_FAILED", "Failed to hand decrypted content to the native plaintext buffer", null)
+            } else {
+                result.success(handle)
+            }
         } finally {
-            // Same finding as handleEncryptMessage, more consequential
-            // here: this is the actual decrypted message content — the
-            // exact thing a self-destruct guarantee is supposed to
-            // protect once Sub-Phase 3D wires self-destruct into the
-            // mobile layer. `result.success()` hands the bytes to
-            // Flutter's binary messenger synchronously (it has its own
-            // copy by the time this call returns), so clearing `plaintext`
-            // immediately after does not corrupt what's already been
-            // sent — it only removes PARDA's own now-redundant Kotlin-side
-            // copy. This does NOT reach into Flutter/Dart's own copy of
-            // the bytes; that side of the boundary needs its own
-            // discipline (Dart-side zeroize on the resulting Uint8List),
-            // which is unaudited here — see docs/phase3-3a-self-destruct-design.md §9.
+            // `nativePlaintextNew` copies `plaintext` into its own
+            // Rust-owned, locked buffer before returning — this Kotlin-side
+            // ByteArray is now a redundant unmanaged copy the same as it
+            // was before this fix, so it still needs the same explicit
+            // clear `handleEncryptMessage` already applies, `finally` so
+            // the exception path is covered too.
             java.util.Arrays.fill(plaintext, 0)
         }
     }

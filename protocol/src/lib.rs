@@ -22,6 +22,8 @@
 //! | [`clock_guard`] | Clock-rollback detection for self-destruct expiry (Sub-Phase 3A) |
 //! | [`secure_memory`] | Cross-platform `mlock`/`VirtualLock` to keep key material out of swap (Sub-Phase 3C) |
 //! | [`dead_drop`] | Anonymous, blinded dead-drop addressing for offline mesh delivery (Sub-Phase 4C) |
+//! | [`plaintext_ffi`] | Native-owned, zeroize-on-release decrypted-plaintext buffer + C ABI for mobile UI layers (Sub-Phase 4.5C) |
+//! | [`trust`] | Out-of-band identity-key verification: fingerprints, `TrustLevel`, `TrustStore` (Sub-Phase 4.5D) |
 //!
 //! ## Security Properties
 //!
@@ -58,12 +60,14 @@ pub mod envelope;
 pub mod error;
 pub mod identity;
 pub mod mixnet;
+pub mod plaintext_ffi;
 pub mod sealed_sender;
 pub mod secure_memory;
 pub mod self_destruct;
 pub mod session;
 pub mod store;
 pub mod transport;
+pub mod trust;
 
 // Re-export frequently-used libsignal types so callers don't need
 // to depend directly on libsignal-protocol in their own Cargo.toml.

@@ -247,7 +247,16 @@ class _ConversationTile extends StatelessWidget {
                   ),
                   if (lastMessage != null)
                     Text(
-                      lastMessage!.body,
+                      // Sub-Phase 4.5C: a received message's plaintext
+                      // lives behind a native handle now, not a cached
+                      // `String` (see models/message.dart) — deliberately
+                      // not decoded just to populate this preview line,
+                      // since every additional place that calls
+                      // `renderCopy()` is one more place a Dart `String`
+                      // materializes and lingers. Sent messages (typed
+                      // locally, never crossed a decrypt boundary) still
+                      // show their real text.
+                      lastMessage!.body ?? '🔒 New message',
                       style: TextStyle(color: Colors.grey.shade500, fontSize: 13),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,

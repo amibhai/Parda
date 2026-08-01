@@ -1,4 +1,3 @@
-import 'dart:typed_data';
 import 'package:flutter/services.dart';
 
 /// Bridge to native libsignal-android / libsignal-swift via MethodChannel.
@@ -21,7 +20,7 @@ import 'package:flutter/services.dart';
 /// | `getPreKeyBundle` | — | `PreKeyBundleJson` |
 /// | `processPreKeyBundle` | `{ remoteUserId: String, bundle: Map }` | `void` |
 /// | `encryptMessage` | `{ remoteUserId: String, plaintext: Uint8List }` | `EnvelopeJson` |
-/// | `decryptMessage` | `{ envelope: Map }` | `Uint8List` |
+/// | `decryptMessage` | `{ envelope: Map }` | `int` (a [PlaintextHandle] ID — Sub-Phase 4.5C, see below) |
 /// | `hasSession` | `{ remoteUserId: String }` | `bool` |
 class SignalBridge {
   static const MethodChannel _channel = MethodChannel('com.parda.app/signal');
@@ -74,10 +73,16 @@ class SignalBridge {
 
   /// Decrypt an incoming envelope map fetched from the relay server.
   ///
-  /// Returns the plaintext bytes. If the envelope is a PreKey message,
-  /// the native side establishes a new session automatically.
-  Future<Uint8List> decryptMessage(Map<String, dynamic> envelopeJson) async {
-    final result = await _channel.invokeMethod<Uint8List>('decryptMessage', {
+  /// Returns a native [PlaintextHandle] ID, **not** the decrypted bytes
+  /// themselves — Sub-Phase 4.5C's fix for the Dart plaintext problem
+  /// (see `docs/phase4.5c-dart-plaintext-design.md`): the decrypted
+  /// content stays behind a native, zeroize-on-release buffer
+  /// (`PlaintextBridge.kt` / `protocol::plaintext_ffi`) and only crosses
+  /// into a Dart-visible copy per-render, via [PlaintextHandle.renderCopy].
+  /// If the envelope is a PreKey message, the native side establishes a
+  /// new session automatically.
+  Future<int> decryptMessage(Map<String, dynamic> envelopeJson) async {
+    final result = await _channel.invokeMethod<int>('decryptMessage', {
       'envelope': envelopeJson,
     });
     return result!;

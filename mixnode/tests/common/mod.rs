@@ -76,3 +76,34 @@ pub async fn wait_for_delivery(
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
 }
+
+/// Sub-Phase 4.5A: poll `store.fetch_pull(rendezvous_token)` until a
+/// stage exists for it (even an empty one — `stage_pull` always inserts
+/// a row, regardless of whether the recipient's queue was non-empty),
+/// or panic after `timeout`. This is the receive-path's arrival signal,
+/// symmetric to [`wait_for_delivery`] for the send path — the moment a
+/// stage exists is the moment the pull request's mix-routed leg actually
+/// reached `/v1/pulls`, which is exactly the timing this sub-phase's
+/// permutation test needs to observe.
+pub async fn wait_for_pull_arrival(
+    store: &SharedRelayStore,
+    rendezvous_token: &str,
+    timeout: Duration,
+) {
+    let start = tokio::time::Instant::now();
+    loop {
+        // A direct existence check that does NOT consume the stage (so
+        // it doesn't race with anything else that might also want it) —
+        // `fetch_pull` clears on read, so poll via a cheap re-stage-safe
+        // path: attempt fetch, and if present, we're done; if the poll
+        // itself is what claims it, that's fine here since nothing else
+        // in this test ever calls fetch_pull for the same token.
+        if store.fetch_pull(rendezvous_token).await.is_some() {
+            return;
+        }
+        if start.elapsed() > timeout {
+            panic!("timed out after {timeout:?} waiting for pull arrival (token {rendezvous_token})");
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}

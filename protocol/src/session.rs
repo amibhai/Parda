@@ -38,7 +38,9 @@ use crate::{
     envelope::{EnvelopeType, MessageEnvelope, ENVELOPE_VERSION_V2},
     error::{PardaError, Result},
     store::InMemorySignalProtocolStore,
+    trust::{self, TrustStore},
 };
+use libsignal_protocol::{IdentityKey, IdentityKeyStore};
 
 /// Plaintext + authenticated sender identity recovered from a sealed-sender
 /// envelope. The sender identity here is trustworthy — it was validated
@@ -48,6 +50,24 @@ pub struct SealedSenderPlaintext {
     pub sender_uuid: String,
     pub device_id: DeviceId,
     pub plaintext: Vec<u8>,
+}
+
+/// Deliberately **not** `#[derive(Debug)]`: this type holds decrypted
+/// message content, and a derived impl would spill it into any `{:?}`
+/// — a log line, a `.unwrap()` panic message, an `expect_err` in a test.
+/// The hand-written impl below prints the authenticated sender and the
+/// plaintext's *length* only. Added in Sub-Phase 4.5D because
+/// `trust_bootstrapping_tests.rs` needed a `Debug` bound; written this
+/// way rather than derived so that reaching for `Debug` here can never
+/// become the thing that leaks a message body.
+impl std::fmt::Debug for SealedSenderPlaintext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedSenderPlaintext")
+            .field("sender_uuid", &self.sender_uuid)
+            .field("device_id", &self.device_id)
+            .field("plaintext", &format_args!("<{} bytes redacted>", self.plaintext.len()))
+            .finish()
+    }
 }
 
 fn now_ms() -> u64 {
@@ -113,6 +133,49 @@ impl SessionManager {
         )
         .await
         .map_err(PardaError::Signal)
+    }
+
+    /// Initiate a session with a remote peer, **first checking the
+    /// bundle's identity key against any out-of-band verification on
+    /// file** for `peer_id` (Sub-Phase 4.5D).
+    ///
+    /// Additive wrapper around [`Self::initiate_session`], deliberately
+    /// not a change to that method's signature — a caller that never
+    /// adopts a [`TrustStore`] gets provably identical behavior to
+    /// before this sub-phase, since the existing path is untouched. See
+    /// `docs/phase4.5d-trust-bootstrapping-design.md` §3.
+    ///
+    /// - Peer not yet verified ([`crate::trust::TrustLevel::Tofu`]) →
+    ///   behaves exactly like [`Self::initiate_session`]. First contact
+    ///   is not, and cannot be, protected by a TOFU scheme; this is
+    ///   stated rather than papered over.
+    /// - Peer verified and the bundle's identity key matches → proceeds.
+    /// - Peer verified and the key does **not** match →
+    ///   [`PardaError::IdentityKeyChangedAfterVerification`], **before**
+    ///   any session state is written. Fail-closed: a rejected bundle
+    ///   leaves the store exactly as it was.
+    pub async fn initiate_session_verified(
+        &mut self,
+        remote_address: &ProtocolAddress,
+        bundle: &PreKeyBundle,
+        trust_store: &dyn TrustStore,
+        peer_id: &str,
+    ) -> Result<()> {
+        let local_identity = self
+            .store
+            .get_identity_key_pair()
+            .await
+            .map_err(PardaError::Signal)?;
+        let remote_identity = bundle.identity_key().map_err(PardaError::Signal)?;
+
+        trust::check_identity(
+            trust_store,
+            peer_id,
+            local_identity.identity_key(),
+            remote_identity,
+        )?;
+
+        self.initiate_session(remote_address, bundle).await
     }
 
     /// Encrypt `plaintext` for `remote_address`.
@@ -301,5 +364,79 @@ impl SessionManager {
             device_id: result.device_id,
             plaintext: result.message,
         })
+    }
+
+    /// Decrypt a sealed-sender envelope, **then check the authenticated
+    /// sender's identity key against any out-of-band verification on
+    /// file** for that sender (Sub-Phase 4.5D).
+    ///
+    /// Additive wrapper around [`Self::decrypt_sealed`], same rationale
+    /// as [`Self::initiate_session_verified`].
+    ///
+    /// **The ordering here is forced by the protocol, and worth stating
+    /// rather than leaving as an apparent oversight:** the check happens
+    /// *after* decryption because the sender's identity key is not
+    /// knowable until libsignal has validated the embedded sender
+    /// certificate — a sealed-sender envelope carries no
+    /// attacker-untrusted sender field to check earlier (that is the
+    /// whole point of the scheme). Consequently, a post-verification
+    /// identity change is detected *after* the plaintext has been
+    /// recovered in memory, but **before it is returned to the caller**:
+    /// this method yields the error, never the plaintext, so no caller
+    /// can act on content from an unexpected identity. That is a
+    /// narrower guarantee than "never decrypted at all," and it is the
+    /// strongest one available at this layer.
+    ///
+    /// `peer_id` is the trust-store key to check against. It is a
+    /// separate parameter rather than being taken from
+    /// `result.sender_uuid` deliberately: the caller decides which
+    /// identity it *expected* to hear from, so a sender substituting a
+    /// different (but individually valid) certificate cannot also choose
+    /// which stored fingerprint it gets compared against.
+    pub async fn decrypt_sealed_verified(
+        &mut self,
+        envelope: &MessageEnvelope,
+        trust_root: &PublicKey,
+        local_uuid: &str,
+        local_device_id: DeviceId,
+        trust_store: &dyn TrustStore,
+        peer_id: &str,
+    ) -> Result<SealedSenderPlaintext> {
+        let local_identity = self
+            .store
+            .get_identity_key_pair()
+            .await
+            .map_err(PardaError::Signal)?;
+
+        let result = self
+            .decrypt_sealed(envelope, trust_root, local_uuid, local_device_id)
+            .await?;
+
+        // The sender's identity key, as authenticated by the validated
+        // certificate chain — recovered here from the store, where
+        // `sealed_sender_decrypt` has just recorded it for the sender's
+        // address.
+        let sender_address =
+            ProtocolAddress::new(result.sender_uuid.clone(), result.device_id);
+        let remote_identity: IdentityKey = self
+            .store
+            .get_identity(&sender_address)
+            .await
+            .map_err(PardaError::Signal)?
+            .ok_or_else(|| {
+                PardaError::SealedSenderAuth(format!(
+                    "no identity key recorded for authenticated sender {sender_address} — \
+                     cannot check it against a verified fingerprint"
+                ))
+            })?;
+
+        trust::check_identity(
+            trust_store,
+            peer_id,
+            local_identity.identity_key(),
+            &remote_identity,
+        )?;
+
+        Ok(result)
     }
 }

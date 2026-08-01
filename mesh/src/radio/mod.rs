@@ -182,11 +182,38 @@ pub fn spawn_rotation_loop(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerHandle(pub(crate) PeerHandleInner);
 
+impl PeerHandle {
+    /// Construct a handle wrapping arbitrary bytes — for `MeshRadio`
+    /// backends that live *outside* this crate (Sub-Phase 4.5B's
+    /// `parda-mobile-bridge`, and the never-compiled Sub-Phase 4.5C iOS
+    /// bridge) and therefore can't reach `PeerHandleInner`'s `pub(crate)`
+    /// variants directly. Such a backend is responsible for its own
+    /// round-tripping scheme (e.g. a JNI-side device reference encoded
+    /// as bytes) — this crate never inspects or interprets the contents.
+    pub fn from_opaque_bytes(bytes: Vec<u8>) -> Self {
+        Self(PeerHandleInner::Opaque(bytes))
+    }
+
+    /// The bytes previously passed to [`Self::from_opaque_bytes`], if
+    /// this handle was constructed that way — `None` for handles
+    /// belonging to an in-crate backend (`Simulated`/`Bluez`), which
+    /// have no meaningful byte representation to hand back.
+    pub fn opaque_bytes(&self) -> Option<&[u8]> {
+        match &self.0 {
+            PeerHandleInner::Opaque(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PeerHandleInner {
     Simulated(u64),
     #[cfg(all(target_os = "linux", feature = "bluez"))]
     Bluez(bluer::Address),
+    /// Round-trip bytes for a `MeshRadio` backend implemented outside
+    /// this crate — see [`PeerHandle::from_opaque_bytes`].
+    Opaque(Vec<u8>),
 }
 
 /// A single observed advertisement: which opaque token, and a handle

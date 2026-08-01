@@ -24,4 +24,11 @@ reqwest        = { version = "0.12", default-features = false, features = ["json
 # For typed request/response validation only (MessageEnvelope shape) —
 # not for any crypto operation. See lib.rs module docs.
 parda-protocol = { path = "../protocol" }
+# Sub-Phase 4.5E: constant-time API-key comparison (auth.rs). A
+# comparison primitive, not a crypto construction — see auth.rs's
+# `key_is_valid` docs for why `==` is not acceptable there.
+subtle         = "2.5"
+# Sub-Phase 4.5E: optional rustls TLS termination, shared with
+# parda-relay and parda-mixnode.
+parda-tls      = { path = "../tls" }
 

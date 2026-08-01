@@ -48,6 +48,34 @@
 //! e.g. `MixTransport`'s, and conflating the two would be the same kind
 //! of "advisory vs. enforced" confusion `envelope.rs`'s own module docs
 //! already warn about for `self_destruct_at` on the wire.
+//!
+//! ## Sub-Phase 4.5E: the holding area, and why it does not weaken the
+//! boundary above
+//!
+//! Sub-Phase 4.5E adds [`LocalMessageStore::stage_self_destructing`] and
+//! a `pending_self_destruct` table, so a pending self-destructing
+//! message survives a process restart instead of silently vanishing (or,
+//! worse, outliving its deadline unnoticed). Read as a summary, "the
+//! store now persists self-destructing messages" would sound like the
+//! refusal above was quietly relaxed. It was not, and the shape of the
+//! change is what guarantees that:
+//!
+//! - **Different table, different type.** The holding area stores a
+//!   `parda_protocol::self_destruct::PersistedSelfDestructState` (AEAD
+//!   ciphertext + derived key + mode + deadline), never a
+//!   `MessageEnvelope`. `store_message`'s refusal is untouched — there
+//!   is still no way to get a self-destructing envelope into `messages`.
+//! - **Rows are deleted, never marked.** Reading one
+//!   ([`LocalMessageStore::take_self_destructing`]) deletes it in the
+//!   same transaction; expired rows are deleted by
+//!   [`LocalMessageStore::purge_expired_self_destructing`]. Nothing here
+//!   accumulates as history.
+//! - **It is a real, documented trade-off, not a free win.** The derived
+//!   key now touches disk (SQLCipher-encrypted, same trust boundary as
+//!   everything else here, never weaker) where Sub-Phase 3A's primitive
+//!   kept it memory-only. That cost is stated in full on
+//!   `PersistedSelfDestructState`, in `docs/THREAT_MODEL.md`, and in the
+//!   README — and staging is opt-in per message, never automatic.
 
 pub mod error;
 
@@ -56,7 +84,10 @@ use std::sync::{
     Arc, Mutex,
 };
 
-use parda_protocol::envelope::MessageEnvelope;
+use parda_protocol::{
+    envelope::MessageEnvelope,
+    self_destruct::{DestructMode, PersistedSelfDestructState},
+};
 use rusqlite::{params, Connection};
 
 pub use error::StoreError;
@@ -68,7 +99,7 @@ pub type SharedLocalMessageStore = Arc<LocalMessageStore>;
 /// `server/src/store.rs`'s identical convention.
 const EPHEMERAL_TEST_KEY: &str = "parda-client-store-ephemeral-test-key-do-not-use-in-production";
 
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 pub struct LocalMessageStore {
     conn: Mutex<Connection>,
@@ -235,6 +266,159 @@ impl LocalMessageStore {
         conn.query_row("SELECT count(*) FROM messages", [], |row| row.get(0))
             .map_err(|e| StoreError::Sqlite(e.to_string()))
     }
+
+    // ── Self-destruct holding area (Sub-Phase 4.5E) ─────────────────────
+    //
+    // See `parda_protocol::self_destruct::PersistedSelfDestructState`'s
+    // docs for the trade-off staging a message here accepts (the derived
+    // key touches disk, SQLCipher-encrypted, instead of never being
+    // persisted at all) and why it is opt-in per message.
+
+    /// Stage an already-sealed self-destructing message so it survives a
+    /// process restart. Returns the holding-area row ID.
+    ///
+    /// This does **not** relax [`Self::store_message`]'s refusal of
+    /// self-destructing envelopes — that boundary is untouched, and this
+    /// writes to an entirely different table. See `run_migrations`.
+    pub async fn stage_self_destructing(
+        &self,
+        peer_address: &str,
+        state: &PersistedSelfDestructState,
+        staged_at_ms: u64,
+    ) -> Result<String, StoreError> {
+        let id = local_row_id();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO pending_self_destruct
+               (id, peer_address, ciphertext, key_bytes, mode, expires_at_ms, staged_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id,
+                peer_address,
+                state.ciphertext(),
+                state.key_bytes().as_slice(),
+                mode_to_str(state.mode()),
+                state.expires_at_ms().map(|ms| ms as i64),
+                staged_at_ms as i64,
+            ],
+        )
+        .map_err(|e| StoreError::Sqlite(e.to_string()))?;
+        Ok(id)
+    }
+
+    /// Read a staged message back **and delete its row in the same
+    /// transaction** — fetch-and-clear, never read-and-leave.
+    ///
+    /// The delete is unconditional and happens even though the caller may
+    /// still fail to [`parda_protocol::self_destruct::SelfDestructingMessage::restore`]
+    /// it (expired deadline, detected clock rollback). That is deliberate
+    /// and is the fail-closed direction: a row that cannot be restored
+    /// must not be left on disk for a later attempt under a more
+    /// favourable clock. Matches the "never a lingering record"
+    /// discipline this store already applies on its refusal path.
+    pub async fn take_self_destructing(
+        &self,
+        id: &str,
+    ) -> Result<Option<PersistedSelfDestructState>, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|e| StoreError::Sqlite(e.to_string()))?;
+
+        let row = tx
+            .query_row(
+                "SELECT ciphertext, key_bytes, mode, expires_at_ms
+                 FROM pending_self_destruct WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .ok();
+
+        let Some((ciphertext, key_vec, mode_str, expires_at_ms)) = row else {
+            return Ok(None);
+        };
+
+        tx.execute("DELETE FROM pending_self_destruct WHERE id = ?1", params![id])
+            .map_err(|e| StoreError::Sqlite(e.to_string()))?;
+        tx.commit().map_err(|e| StoreError::Sqlite(e.to_string()))?;
+
+        let mode = mode_from_str(&mode_str)
+            .ok_or_else(|| StoreError::Codec(format!("corrupt mode column: {mode_str:?}")))?;
+        let key_bytes: [u8; 32] = key_vec.as_slice().try_into().map_err(|_| {
+            StoreError::Codec(format!(
+                "corrupt key_bytes column: expected 32 bytes, got {}",
+                key_vec.len()
+            ))
+        })?;
+
+        Ok(Some(PersistedSelfDestructState::from_parts(
+            ciphertext,
+            key_bytes,
+            mode,
+            expires_at_ms.map(|ms| ms as u64),
+        )))
+    }
+
+    /// Delete every staged row whose deadline has passed as of `now_ms`.
+    ///
+    /// Rows with a `NULL` deadline (pure read-triggered — no deadline by
+    /// design) are never swept: they are erased on read, and sweeping
+    /// them on a timer would silently convert them into a different mode
+    /// than the sender chose.
+    ///
+    /// Callers should run this at startup, *before* restoring anything,
+    /// so a message that expired during downtime is deleted rather than
+    /// merely refused on each attempt.
+    pub async fn purge_expired_self_destructing(&self, now_ms: u64) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM pending_self_destruct
+             WHERE expires_at_ms IS NOT NULL AND expires_at_ms <= ?1",
+            params![now_ms as i64],
+        )
+        .map_err(|e| StoreError::Sqlite(e.to_string()))
+    }
+
+    /// IDs of every currently-staged message for `peer_address`, oldest
+    /// first. Deliberately returns IDs rather than the states themselves:
+    /// reading a state is a fetch-and-clear operation
+    /// ([`Self::take_self_destructing`]), so a bulk "list with contents"
+    /// call would either have to consume everything it listed or leave
+    /// keys in memory the caller never asked for.
+    pub async fn pending_self_destruct_ids(
+        &self,
+        peer_address: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM pending_self_destruct
+                 WHERE peer_address = ?1 ORDER BY staged_at_ms ASC",
+            )
+            .map_err(|e| StoreError::Sqlite(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![peer_address], |row| row.get::<_, String>(0))
+            .map_err(|e| StoreError::Sqlite(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| StoreError::Sqlite(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    /// Staged-row count — test/diagnostic convenience.
+    pub async fn pending_self_destruct_count(&self) -> Result<i64, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT count(*) FROM pending_self_destruct", [], |row| row.get(0))
+            .map_err(|e| StoreError::Sqlite(e.to_string()))
+    }
 }
 
 fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
@@ -258,11 +442,55 @@ fn run_migrations(conn: &Connection) -> Result<(), StoreError> {
         .map_err(|e| StoreError::Sqlite(e.to_string()))?;
     }
 
+    // ── v2 (Sub-Phase 4.5E): the self-destruct holding area ──────────────
+    //
+    // Deliberately a *separate table* from `messages`, not a flag on it.
+    // `messages` is durable history and its write path refuses
+    // self-destructing envelopes outright (see module docs) — that
+    // refusal is a load-bearing structural boundary and must not become
+    // "refuses, unless a column says otherwise." A row here is
+    // short-lived pending state that gets DELETEd, never history.
+    if current < 2 {
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS pending_self_destruct (
+                id            TEXT PRIMARY KEY,
+                peer_address  TEXT NOT NULL,
+                ciphertext    BLOB NOT NULL,
+                key_bytes     BLOB NOT NULL,
+                mode          TEXT NOT NULL,
+                expires_at_ms INTEGER,
+                staged_at_ms  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_sd_peer ON pending_self_destruct(peer_address);
+            CREATE INDEX IF NOT EXISTS idx_pending_sd_expiry ON pending_self_destruct(expires_at_ms);
+            ",
+        )
+        .map_err(|e| StoreError::Sqlite(e.to_string()))?;
+    }
+
     if current < CURRENT_SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
             .map_err(|e| StoreError::Sqlite(e.to_string()))?;
     }
     Ok(())
+}
+
+fn mode_to_str(mode: DestructMode) -> &'static str {
+    match mode {
+        DestructMode::TimeBound => "time_bound",
+        DestructMode::ReadTriggered => "read_triggered",
+        DestructMode::Combined => "combined",
+    }
+}
+
+fn mode_from_str(s: &str) -> Option<DestructMode> {
+    match s {
+        "time_bound" => Some(DestructMode::TimeBound),
+        "read_triggered" => Some(DestructMode::ReadTriggered),
+        "combined" => Some(DestructMode::Combined),
+        _ => None,
+    }
 }
 
 /// A dependency-free local primary key: nanosecond timestamp plus a

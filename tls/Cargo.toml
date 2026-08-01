@@ -1,0 +1,32 @@
+[package]
+name        = "parda-tls"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+description = "PARDA shared TLS termination for parda-relay and parda-mixnode (Sub-Phase 4.5E)"
+
+[dependencies]
+axum           = { version = "0.7", features = ["json", "macros"] }
+tokio          = { workspace = true, features = ["full"] }
+tracing        = { workspace = true }
+thiserror      = { workspace = true }
+# `tls-rustls-no-provider` rather than `tls-rustls`, plus an explicit
+# `ring` provider below. `tls-rustls` would pull in `rustls/aws-lc-rs`,
+# giving this workspace two rustls crypto providers at once (reqwest's
+# rustls stack is already linked into parda-mixnode and parda-protocol) —
+# with more than one compiled in, rustls has no unambiguous default and
+# panics at first use unless a provider is installed explicitly. Choosing
+# `ring` deliberately: it is already built in this workspace (it appears
+# in the parda-mobile-bridge Android cross-compile), so it is known to
+# compile on every target this project builds for, whereas aws-lc-rs
+# carries a cmake/C toolchain requirement that is not otherwise needed
+# here. `install_ring_provider()` makes the choice explicit at runtime
+# rather than relying on feature unification staying this way.
+axum-server    = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# Self-signed development certificates only — see `dev_certificate`'s
+# docs for why this is never a production path.
+rcgen          = "0.13"
+
+[dev-dependencies]
+reqwest        = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

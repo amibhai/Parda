@@ -11,6 +11,8 @@
 //! | POST | `/v1/messages/{recipient_id}` | Submit encrypted envelope |
 //! | GET  | `/v1/messages/{user_id}` | Fetch and drain pending messages |
 //! | DELETE | `/v1/messages/{user_id}/{msg_id}` | Ack and delete a single message |
+//! | POST | `/v1/pulls` | Stage a queue under a rendezvous token (Sub-Phase 4.5A; called by a mix node's final hop, not directly by clients) |
+//! | GET  | `/v1/pulls/{rendezvous_token}` | Fetch and clear a staged pull response (Sub-Phase 4.5A) |
 //! | GET  | `/health` | Health check (no auth, no state) |
 //!
 //! ## Sender-identity discipline (Phase 2)
@@ -33,8 +35,9 @@ use uuid::Uuid;
 
 use crate::{
     models::{
-        ApiOk, FetchMessagesResponse, IssueSenderCertRequest, MessageEnvelope, PreKeyBundleJson,
-        SenderCertificateResponse, StoredEnvelope, TrustRootResponse,
+        ApiOk, FetchMessagesResponse, FetchPullResponse, IssueSenderCertRequest, MessageEnvelope,
+        PreKeyBundleJson, PullRequest, SenderCertificateResponse, StoredEnvelope,
+        TrustRootResponse,
     },
     store::SharedRelayStore,
 };
@@ -204,6 +207,52 @@ pub async fn fetch_messages(
     let messages = store.drain(&user_id).await;
     tracing::debug!(user_id = %user_id, count = messages.len(), "messages fetched");
     Json(FetchMessagesResponse { messages })
+}
+
+// ─── Pull-request endpoints (Sub-Phase 4.5A) ──────────────────────────────────
+//
+// See docs/phase4.5a-receive-path-design.md. `POST /v1/pulls` is called
+// only by a mix node's final hop (after unwrapping a `PULL_DESTINATION_TAG`
+// packet), never directly by a client — that's the entire point: an
+// external observer of the relay's edge sees this connection coming from a
+// mix node, and sees `rendezvous_token` only, never `recipient_id`.
+// `GET /v1/pulls/{token}` is the leg the client itself calls directly, and
+// deliberately carries no recipient identity either.
+
+/// `POST /v1/pulls` — stage a recipient's current queue under a
+/// single-use token, in place of delivering it immediately.
+pub async fn stage_pull(
+    State(store): State<SharedRelayStore>,
+    Json(request): Json<PullRequest>,
+) -> impl IntoResponse {
+    // Deliberately does not log `recipient_id` here beyond debug level,
+    // matching the sender-identity discipline this file already holds
+    // itself to for `sender_id` — this endpoint's whole purpose is to
+    // keep an external observer from reading recipient identity off the
+    // wire; logging it at the relay's own INFO level would defeat that
+    // even though the relay operator already legitimately knows it.
+    tracing::debug!(
+        recipient = %request.recipient_id,
+        token = %request.rendezvous_token,
+        "pull request staged"
+    );
+    store
+        .stage_pull(request.recipient_id, request.rendezvous_token)
+        .await;
+    (StatusCode::ACCEPTED, Json(ApiOk::success()))
+}
+
+/// `GET /v1/pulls/{rendezvous_token}` — fetch-and-clear whatever was
+/// staged under `rendezvous_token`. An unknown or already-claimed token
+/// returns an empty list, not an error — indistinguishable from "nothing
+/// new yet" by design, so a carrier/observer can't use the response
+/// shape itself as a side channel.
+pub async fn fetch_pull(
+    State(store): State<SharedRelayStore>,
+    Path(rendezvous_token): Path<String>,
+) -> impl IntoResponse {
+    let messages = store.fetch_pull(&rendezvous_token).await.unwrap_or_default();
+    Json(FetchPullResponse { messages })
 }
 
 /// `DELETE /v1/messages/{user_id}/{msg_id}` — delete a specific message.

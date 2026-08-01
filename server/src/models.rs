@@ -52,6 +52,18 @@ pub struct FetchMessagesResponse {
     pub messages: Vec<StoredEnvelope>,
 }
 
+/// `POST /v1/pulls` request body (Sub-Phase 4.5A) — posted by a mix
+/// node's final hop after unwrapping a `PULL_DESTINATION_TAG` packet,
+/// never directly by a client. Reused verbatim from
+/// `parda_protocol::mixnet` rather than duplicated — same shape the
+/// Sphinx payload already decodes to. See
+/// `docs/phase4.5a-receive-path-design.md`.
+pub use parda_protocol::mixnet::PullRequest;
+
+/// `GET /v1/pulls/{rendezvous_token}` response body — same shape as
+/// [`FetchMessagesResponse`], reused directly rather than duplicated.
+pub type FetchPullResponse = FetchMessagesResponse;
+
 /// `POST /v1/certs/{user_id}` request body.
 ///
 /// The relay signs whatever identity key is presented here — there is no

@@ -59,13 +59,18 @@
 //!   trust-on-first-use configured list, same posture already accepted
 //!   elsewhere in the project (prekey bundle upload, sealed-sender
 //!   certificate issuance).
-//! - Only the send path is mix-anonymized. Fetching messages
-//!   (`MixTransport::receive`) still talks to the relay directly — see
-//!   `transport` module docs.
+//! - **Sub-Phase 4.5A: the receive path is now mix-anonymized too.**
+//!   `MixTransport::receive` no longer talks to the relay directly —
+//!   see `transport` module docs and
+//!   `docs/phase4.5a-receive-path-design.md` for the two-leg
+//!   rendezvous-token mechanism this module's [`PULL_DESTINATION_TAG`]
+//!   and [`PullRequest`] implement. `DirectTransport::receive` is
+//!   unchanged — it never claimed anonymity.
 
 use std::time::Duration;
 
-use rand::seq::SliceRandom;
+use rand::{seq::SliceRandom, RngCore};
+use serde::{Deserialize, Serialize};
 use sphinx_packet::{
     constants::{DESTINATION_ADDRESS_LENGTH, NODE_ADDRESS_LENGTH},
     header::delays::{self, Delay},
@@ -84,6 +89,46 @@ pub const RELAY_DESTINATION_TAG: &[u8] = b"PARDA-RELAY-V1";
 /// Marks a Sphinx `Destination` as Loopix-style "drop cover" traffic — a
 /// packet that traversed a real path but must never reach the relay.
 pub const COVER_DESTINATION_TAG: &[u8] = b"PARDA-COVER-V1";
+
+/// Marks a Sphinx `Destination` as a Sub-Phase 4.5A pull request — see
+/// `docs/phase4.5a-receive-path-design.md`. The final hop decodes the
+/// recovered payload as [`PullRequest`] and stages the recipient's
+/// current queue at the relay under `rendezvous_token`, rather than
+/// delivering an envelope.
+pub const PULL_DESTINATION_TAG: &[u8] = b"PARDA-PULL-V1";
+
+/// Payload carried by a [`PULL_DESTINATION_TAG`] Sphinx packet — the
+/// entire request is just enough for the relay to know which queue to
+/// stage and which single-use token to stage it under. Never contains
+/// message content; `recipient_id` is the same plaintext routing field
+/// the relay already sees for every send today (`docs/THREAT_MODEL.md`
+/// §3.5 — "the relay still needs to know where to deliver the
+/// envelope"). `rendezvous_token` is freshly random per call
+/// (`MixTransport::receive`, `protocol/src/transport.rs`) and carries no
+/// derivable relationship to `recipient_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullRequest {
+    pub recipient_id: String,
+    /// Hex-encoded random bytes — a string so it round-trips cleanly as
+    /// both a Sphinx JSON payload field and a URL path segment
+    /// (`GET /v1/pulls/{rendezvous_token}`).
+    pub rendezvous_token: String,
+}
+
+impl PullRequest {
+    /// Generate a fresh request for `recipient_id` with a new random
+    /// token. `OsRng`, matching the CSPRNG posture already used
+    /// throughout this crate (identity keys, self-destruct IKM,
+    /// dead-drop decoys).
+    pub fn new(recipient_id: impl Into<String>) -> Self {
+        let mut token_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut token_bytes);
+        Self {
+            recipient_id: recipient_id.into(),
+            rendezvous_token: hex::encode(token_bytes),
+        }
+    }
+}
 
 /// Lower bound on mix-network path length. Below this, a single
 /// compromised or observant node could trivially correlate sender and
@@ -264,6 +309,12 @@ pub enum UnwrapOutcome {
     /// This node is the final hop and the destination tag matched the
     /// relay marker. `envelope_bytes` is the recovered plaintext.
     Deliver { envelope_bytes: Vec<u8> },
+    /// This node is the final hop and the destination tag matched
+    /// [`PULL_DESTINATION_TAG`] (Sub-Phase 4.5A). `request_bytes` decodes
+    /// as [`PullRequest`]. The node should stage the recipient's queue
+    /// at the relay under the carried token rather than deliver an
+    /// envelope — see `docs/phase4.5a-receive-path-design.md`.
+    PullRequest { request_bytes: Vec<u8> },
     /// This node is the final hop of a drop-cover packet. Nothing should
     /// be delivered anywhere — discard.
     DropCover,
@@ -303,6 +354,11 @@ pub fn process_packet(packet_bytes: &[u8], node_secret: &StaticSecret) -> Result
                     PardaError::MixRouting(format!("failed to recover Sphinx payload: {e}"))
                 })?;
                 Ok(UnwrapOutcome::Deliver { envelope_bytes })
+            } else if tag == PULL_DESTINATION_TAG {
+                let request_bytes = payload.recover_plaintext().map_err(|e| {
+                    PardaError::MixRouting(format!("failed to recover Sphinx payload: {e}"))
+                })?;
+                Ok(UnwrapOutcome::PullRequest { request_bytes })
             } else if tag == COVER_DESTINATION_TAG {
                 Ok(UnwrapOutcome::DropCover)
             } else {

@@ -1,6 +1,6 @@
 # PARDA Threat Model
 
-**Status:** Finalized for Phase 1 + Sub-Phase 2A + Sub-Phase 2B + Phase 3 (3A-3D) + Phase 4 (4A-4D) — v0.4.0 | Last updated: 2026-08-01
+**Status:** Finalized for Phase 1 + Sub-Phase 2A + Sub-Phase 2B + Phase 3 (3A-3D) + Phase 4 (4A-4D) + Phase 4.5 (4.5A-4.5E) — v0.5.0 | Last updated: 2026-08-02
 
 ---
 
@@ -21,7 +21,9 @@ This document defines the threat model for PARDA (Privacy-Assured Resilient Defe
 | Sender certificates | Sub-Phase 2A: short-lived certificates binding an identity key to a name, used to authenticate senders inside sealed-sender envelopes |
 | Device state | Local message store, key material on disk |
 | Relay store contents | Sub-Phase 2A: SQLCipher database holding prekey bundles and queued envelopes |
-| Mix-node identity keys | Sub-Phase 2B: X25519 keypairs mix nodes use to unwrap Sphinx onion layers. Ephemeral, in-memory only — no persistence yet (`mixnode/src/identity.rs`) |
+| Mix-node identity keys | Sub-Phase 2B: X25519 keypairs mix nodes use to unwrap Sphinx onion layers. Persisted to a key file when `MIXNODE_KEY_PATH` is set (Sub-Phase 4.5E), ephemeral otherwise; never hardware-backed (`mixnode/src/identity.rs`) |
+| Verified peer fingerprints | Sub-Phase 4.5D: which peers a user has confirmed out-of-band, and the fingerprint confirmed for each (`parda_protocol::trust::TrustStore`). Not secret, but integrity-critical — an adversary who can rewrite this store can silently downgrade a `Verified` peer back to TOFU |
+| Staged self-destruct keys | Sub-Phase 4.5E: derived self-destruct keys for messages persisted through the restart-survival holding area. SQLCipher-encrypted at rest; the one place a self-destruct key touches disk at all — see §3.4 |
 
 ---
 
@@ -31,15 +33,17 @@ This document defines the threat model for PARDA (Privacy-Assured Resilient Defe
 
 The primary adversary can **observe all network traffic** on all links simultaneously — including encrypted packets, IP headers, and timing information. The GPA cannot break well-implemented cryptography but can perform traffic analysis.
 
-**PARDA goal:** Sender-receiver unlinkability under GPA observation via mix-network routing and cover traffic (Sub-Phase 2B — **implemented for the send path**; see §3.6).
+**PARDA goal:** Sender-receiver unlinkability under GPA observation via mix-network routing and cover traffic (Sub-Phase 2B — send path; **Sub-Phase 4.5A — receive path**; see §3.6).
 
 **What Sub-Phase 2B changes:** `MixTransport` (`protocol/src/transport.rs`, `protocol/src/mixnet.rs`) routes every outgoing envelope through a ≥3-hop Sphinx mix network (`parda-mixnode`) before it ever reaches `parda-relay`. A GPA watching the wire now sees, per hop, only a fixed-size Sphinx packet indistinguishable from any other real or cover packet — not the original sender's connection to the relay. `mixnode/tests/timing_correlation_tests.rs::test_send_to_arrival_timing_does_not_leak_flow_pairing_above_chance` demonstrates (via a permutation test, not eyeballing) that send-order and relay-arrival-order are not correlated above chance at the tested scale.
 
+**What Sub-Phase 4.5A changes:** `MixTransport::receive` no longer fetches from the relay directly. It now runs a two-leg protocol specified in `docs/phase4.5a-receive-path-design.md`: (1) a Sphinx-wrapped pull request — `{recipient_id, rendezvous_token}`, tagged `PULL_DESTINATION_TAG` — routed through the mix network exactly like a send, landing at the relay's `POST /v1/pulls`; (2) a direct `GET /v1/pulls/{rendezvous_token}` that retrieves whatever was staged. `mixnode/tests/receive_timing_correlation_tests.rs::test_pull_request_entry_to_arrival_timing_does_not_leak_flow_pairing_above_chance` proves leg 1 gets the identical entry/exit timing-decorrelation guarantee send already has, via the identical permutation-test methodology. `mixnode/src/cover_traffic.rs::spawn_pull_cover` extends the existing Loopix-style drop-cover mechanism to also mask "does a pull happen at all" at the mix-network layer.
+
 **What is still a gap, precisely stated (not glossed over):**
-- **Receive path is unchanged.** `MixTransport::receive` fetches from the relay exactly like `DirectTransport` — a GPA watching a client's connection to the relay still sees *that a fetch happened* and to which `recipient_id`, same as Phase 1/Sub-Phase 2A. Anonymizing the pull side needs a Loopix-style provider/pull protocol, not attempted here — see `protocol/src/transport.rs` module docs.
+- **The retrieval leg (leg 2) still reveals the client's IP to the relay at that moment.** `GET /v1/pulls/{rendezvous_token}` is a direct connection — it reveals no identity (the token is unlinkable and freshly random; see §3.7's-adjacent reasoning in the design note §3), but the connection itself is visible to the relay and to anything watching that specific link. This is the *same class* of residual gap already accepted for sealed sender (identity hidden, not IP — §3.5) and for send (client's connection to its first mix hop is visible, below) — not a new or worse gap, but not full Loopix-style unlinkability either, which would need Sphinx SURBs or an always-reachable client listener; the design note §1 explains why both were rejected as disproportionate to this sub-phase.
 - **No decentralized mix-node directory.** `MixTopology` is a static, trust-on-first-use configured list (same posture Phase 1/2A already accept for prekey bundles and sealed-sender certificates) — see §3.6 and §4.
-- **The client's own connection to the first mix hop is still a TCP connection a GPA can see the source IP of.** Sphinx hides *content and downstream routing*, not the fact that this client is talking to *a* mix node at some observed time — cover traffic (§3.6) mitigates but does not eliminate this at low real-traffic volumes, matching Loopix's own stated limits.
-- A GPA who can also compromise or subpoena the relay still learns exactly what the relay's own logs contain for the *final* hop that delivered to it (which, per §3.5, is never the true original sender for a sealed-sender + mix-routed message) — nothing more, nothing less.
+- **The client's own connection to the first mix hop is still a TCP connection a GPA can see the source IP of.** Sphinx hides *content and downstream routing*, not the fact that this client is talking to *a* mix node at some observed time — cover traffic (§3.6) mitigates but does not eliminate this at low real-traffic volumes, matching Loopix's own stated limits. This applies identically to leg 1 of a pull request as it already did to a send.
+- A GPA who can also compromise or subpoena the relay still learns exactly what the relay's own logs contain for the *final* hop that delivered to it (which, per §3.5, is never the true original sender for a sealed-sender + mix-routed message) — nothing more, nothing less. The relay operator itself still legitimately learns `recipient_id` for a pull request (leg 1's final hop hands it over, the same way it already learns `recipient_id` for every send) — what changed is what an *external* observer of the wire can read, not what the relay operator's own logs contain.
 
 ### 3.2 Active Relay-Node Adversary (Sub-Phase 2B mix network)
 
@@ -72,10 +76,10 @@ An adversary with **physical access to a device** after message delivery. May at
 `protocol/src/self_destruct.rs`'s memory-forensics tests — either when a monotonic-clock-anchored timer expires (`seal`, time-bound) or atomically on first successful read (`seal_read_triggered`, read-triggered — erasure happens inside the same held lock as the decrypt, before returning to the caller, so there is no window in which a second reader could find the key still live; see design note §5b). **This is a genuinely narrower claim than the PARDA goal above states**, and the gap is specific:
 
 - **What's proven:** the derived key is gone from *live, resident* process memory after expiry/read — not merely unreachable through the API. Proven for the erasure mechanism itself two ways: reading the same live-typed reference immediately before/after the explicit zeroize call (`test_erase_zeroizes_before_clearing_and_ends_up_gone`), and, on Linux, scanning all of `/proc/self/mem` for the key's exact bytes before and after (`test_key_bytes_absent_from_process_memory_after_expiry`). Read-triggered atomicity — no double-read, even under a race — is proven by `test_read_triggered_concurrent_opens_only_one_succeeds`: 32 callers released simultaneously via a barrier all race to open the same message; exactly one succeeds, every run, deterministically (a mutex-structural guarantee, not a timing-dependent one). The derived key's memory is locked from creation to erasure, verified against the OS's own accounting (`/proc/self/status`'s `VmLck`, Linux) rather than trusting `mlock`'s return code alone, and shown to survive 256 MiB of unrelated memory pressure without the lock being silently dropped. The forensic-recovery capstone test (`protocol/tests/forensic_recovery_tests.rs`) simulates seizure immediately after destruction fires for both modes and confirms the plaintext is unrecoverable — the sub-phase's actual deliverable, per the brief's own framing.
-- **What's explicitly NOT yet proven or defended:** hibernation (which can snapshot locked pages to disk by design — `mlock` does not defend against this); the plaintext buffer `open()` returns is zeroized but not memory-locked (only the derived key is — see design note §8); Windows lacks a low-friction way to verify locking via OS accounting the way Linux's `VmLck` does, so verification there is limited to `VirtualLock`'s return code; and — critically for *this* adversary specifically — **an adversary who obtains a memory dump *before* expiry/read fires always gets the plaintext.** No cryptographic self-destruct scheme changes that; PARDA does not claim otherwise. **A self-destructing message still does not survive an app restart while still pending** — `parda-client-store` (Sub-Phase 3D) persists message history, but its write path structurally *refuses* any envelope with `self_destruct_at` set or `read_triggered_destruct = true` (`LocalMessageStore::store_message`, tested); this is correct, deliberate behavior for the persistence/destructibility boundary, not a bug, but it does mean a self-destructing message that arrives while the app is closed and isn't opened before the app is later killed has no restart-surviving holding area at all yet.
+- **What's explicitly NOT yet proven or defended:** hibernation (which can snapshot locked pages to disk by design — `mlock` does not defend against this); the plaintext buffer `open()` returns is zeroized but not memory-locked (only the derived key is — see design note §8); Windows lacks a low-friction way to verify locking via OS accounting the way Linux's `VmLck` does, so verification there is limited to `VirtualLock`'s return code; and — critically for *this* adversary specifically — **an adversary who obtains a memory dump *before* expiry/read fires always gets the plaintext.** No cryptographic self-destruct scheme changes that; PARDA does not claim otherwise. **Restart survival exists as of Sub-Phase 4.5E, and changes this adversary's picture in one specific, unfavourable way that must not be glossed over.** `LocalMessageStore::stage_self_destructing` persists a pending message's *already-sealed* state into a dedicated `pending_self_destruct` table (`store_message`'s structural refusal of self-destructing envelopes is untouched — different table, different type). Because forward secrecy already destroyed the Double-Ratchet step-key at first decrypt, the message cannot be re-derived from its envelope, so what must persist necessarily includes **the derived self-destruct key**. Sub-Phase 3A's claim was that this key never touches disk; for a staged message that claim no longer holds. The key is SQLCipher-encrypted at rest — the same trust boundary as everything else in that store, never weaker — but a device-seizure adversary who also recovers the client-store key and images the disk during the message's live window now recovers the plaintext, where previously they would have had to image volatile memory in that same window. Staging is opt-in per message and never automatic, precisely so this trade-off is a decision rather than a default. Restoration is guarded: `SelfDestructingMessage::restore` refuses on a detected clock rollback (`clock_guard`) and on an already-passed deadline, downtime counts against the message's life, and rows are deleted rather than marked — including rows that failed to restore, so a refused message cannot be retried later under a more favourable clock. Tested in `client-store/tests/restart_survival_tests.rs`, including a real database file closed and reopened.
 - **Clock trust (this adversary's core capability, time-bound mode only):** since this adversary has the device, they can change its wall clock. Primary defense is a monotonic (`Instant`) timer, immune to wall-clock changes for as long as the process runs; `clock_guard`'s persisted watermark detects and fails closed on a wall-clock rollback across a process restart. **Neither defends against a rooted/jailbroken device that can also rewrite the persisted watermark file directly, nor against a device that's powered off and never allowed to run the app process again** — both are stated plainly as unsolved in `docs/phase3-3a-self-destruct-design.md` §3, not glossed over. Read-triggered mode has no clock dependency at all — its own gap is different: a message that's never read stays readable indefinitely, which is its documented contract, not a flaw.
 - **Session-level destruct ("burn this conversation," Sub-Phase 3D) has a materially weaker guarantee than message-level self-destruct, by necessity, not oversight.** `SessionManager::burn_conversation` removes session and trust state from PARDA's own store — real, tested (`protocol/tests/session_burn_tests.rs`) — but cannot provably zeroize the underlying key bytes: `libsignal-protocol` v0.66.0's `PrivateKey` is a non-zeroizing `Copy` type (confirmed by reading `rust/core/src/curve.rs` in the pinned tag), so libsignal's own internals may hold implicit copies no code in this project can see or overwrite without forking libsignal. See design note §12.
-- **Mobile client, audited (§9 of the design note):** no self-destruct integration exists on mobile yet — Sub-Phase 3D built the CLI/store/gateway application layer, not the mobile one. Auditing the *existing* Phase 1 plaintext handling in `SignalPlugin.kt` found decrypted plaintext crossing the MethodChannel boundary in a JVM `ByteArray` with no explicit clearing; fixed by zeroizing it after use — **this fix is reasoned-correct but still not runtime-verified against a real Flutter/Android build** (a different toolchain gap than the Perl one Sub-Phase 3D resolved for the Rust crates; not attempted). A deeper, unresolved finding: `session_service.dart` converts plaintext to a Dart `String`, which has no mutable backing storage — **the current mobile architecture cannot provide a "provably erased" guarantee once plaintext becomes a `String`, independent of any zeroize discipline applied earlier in the chain.** No iOS native bridge exists at all to audit.
+- **Mobile client (Sub-Phase 3C audit, substantially addressed in Sub-Phase 4.5C):** the Phase 1 finding was that decrypted plaintext crossed the MethodChannel in a JVM `ByteArray` with no clearing, and — the deeper problem — that `session_service.dart` then converted it to a Dart `String`, which has no mutable backing storage, so no zeroize discipline anywhere earlier in the chain could make it erasable. **Sub-Phase 4.5C removes the decrypted content from that path entirely:** `SignalPlugin.decryptMessage` now hands Dart an opaque handle into a native, memory-locked, zeroize-on-release buffer (`parda_protocol::plaintext_ffi::PlaintextHandle`, reusing `self_destruct`/`secure_memory`'s already-audited discipline), and `SessionService` caches handles rather than `String`s, releasing them all when the app is backgrounded. **What remains, stated directly:** Flutter's `Text` widget accepts only a Dart `String` — there is no public API to render from a native buffer — so a transient `String` still materializes for each render and persists at the Dart GC's discretion. The exposure window narrows from the whole app session to a render pass; it does not close. Against *this* adversary specifically, a memory dump taken inside that window still yields the plaintext, exactly as the general "dump before erasure always wins" statement above already says. The handle lifecycle itself is tested at the JNI boundary by `PlaintextForensicRecoveryTest.kt` (an on-device `/proc/self/mem` canary scan) — **written and compiled, but not executed on a device in this phase**; the equivalent pure-Rust test (`plaintext_ffi`'s Linux-only canary test) does run in CI. The iOS bridge now exists as source (`SignalPlugin.swift`, `CoreBluetoothMeshRadio.swift`) but has **never been compiled or run**, categorically — no macOS/Xcode exists in this environment — so it is a reviewed design sketch and provides no verified guarantee whatsoever.
 
 ### 3.5 Curious/Malicious Relay Operator (Sub-Phase 2A — implemented and tested)
 
@@ -92,7 +96,7 @@ The adversary *can* still see: `recipient_id` (routing requires it), envelope si
 - `protocol/tests/sealed_sender_tests.rs` — cryptographic properties: round-trip authentication, rejection of wrong trust root / expired / forged certificates, and that `decrypt()` (non-sealed path) refuses to touch a sealed envelope.
 - `server/tests/sealed_sender_relay_tests.rs::test_malicious_relay_cannot_recover_sender_identity` — a harness with full access to the real relay's captured logs and live store contents, run across a corpus of N=12 distinct sealed senders, asserting none is recoverable.
 
-**Trust assumption this does NOT eliminate:** the relay's sealed-sender CA has no account authentication behind it (`/v1/certs/{user_id}` issues a certificate for whatever identity key is presented — the same Trust-On-First-Use posture Phase 1 already had for `/v1/keys/{user_id}` prekey bundle uploads). A network-level MITM or a malicious relay operator *at enrollment time* could issue itself a certificate claiming to be someone else's `sender_uuid` bound to an attacker-controlled identity key, and any recipient who later X3DH-handshakes with that attacker (believing it to be the real user) would accept sealed messages "from" that forged identity. This is bounded, not eliminated, by the same out-of-band safety-number verification Phase 1 already recommends for identity key trust (`docs/phase1-architecture.md` §10, risk #3) — sealed sender authenticates *within* an established trust relationship, it does not establish one.
+**Trust assumption this does NOT eliminate:** the relay's sealed-sender CA has no account authentication behind it (`/v1/certs/{user_id}` issues a certificate for whatever identity key is presented — the same Trust-On-First-Use posture Phase 1 already had for `/v1/keys/{user_id}` prekey bundle uploads). A network-level MITM or a malicious relay operator *at enrollment time* could issue itself a certificate claiming to be someone else's `sender_uuid` bound to an attacker-controlled identity key, and any recipient who later X3DH-handshakes with that attacker (believing it to be the real user) would accept sealed messages "from" that forged identity. As of Sub-Phase 4.5D this is **bounded by an implemented and tested mechanism rather than only by a recommendation** — see §3.8 — but only for peers a user has actually verified out-of-band; sealed sender authenticates *within* an established trust relationship, it does not establish one.
 
 ### 3.6 Sub-Phase 2B Mix-Network Adversary Capability Boundaries (implemented)
 
@@ -102,16 +106,17 @@ This section states what Sphinx packet path-length, per-hop delay, and cover-tra
 
 **Mixing mechanism, precisely:** per-hop delay is sampled by the *sender* from an exponential distribution (`sphinx_packet::header::delays::generate_from_average_duration`, mean configurable, default 200ms — Piotrowska et al., "The Loopix Anonymity System," USENIX Security 2017) and embedded in the Sphinx header; each node honors the delay it's handed rather than sampling its own (`protocol/src/mixnet.rs` module docs explain why: a node that samples its own delay could be influenced or fingerprinted by comparing its behavior to the sender-committed distribution). This is continuous-time mixing, not batch-and-flush — see `mixnode/src/mixing.rs` module docs for why that distinction matters (batching would reintroduce a "which packets shared a batch" correlation signal).
 
-**Cover traffic:** each mix node independently emits Loopix-style "drop cover" packets (`mixnode/src/cover_traffic.rs`) at exponentially-distributed intervals, routed through a real ≥3-hop path of its configured peers and discarded at the final hop rather than delivered. This requires `MIXNODE_PEERS` to be configured with at least `mixnet::MIN_PATH_LENGTH` peers — **a node with fewer configured peers emits no cover traffic at all** (logged as a warning, not silently degraded to "less cover traffic"). This is a real, documented operational gap: an under-configured node's real-traffic volume alone is observable to a GPA at that node's edges.
+**Cover traffic:** each mix node independently emits Loopix-style "drop cover" packets (`mixnode/src/cover_traffic.rs::spawn`) at exponentially-distributed intervals, routed through a real ≥3-hop path of its configured peers and discarded at the final hop rather than delivered, **and (Sub-Phase 4.5A) a second, independent pull-cover loop** (`cover_traffic.rs::spawn_pull_cover`) emitting fabricated-but-real `PULL_DESTINATION_TAG` packets that genuinely reach the relay's `/v1/pulls` and expire unclaimed — masking "did a pull happen right now" the way the original loop masks "did a send happen right now." Both require `MIXNODE_PEERS` to be configured with at least `mixnet::MIN_PATH_LENGTH` peers — **a node with fewer configured peers emits neither kind of cover traffic** (logged as a warning, not silently degraded). This is a real, documented operational gap: an under-configured node's real-traffic volume alone is observable to a GPA at that node's edges.
 
 **What a Global Passive Adversary (§3.1) still learns even under full protocol correctness:**
 - Aggregate traffic volume in and out of the mix network as a whole.
 - That *some* client is active, from connection timing to its entry node (cover traffic reduces but does not perfectly eliminate this at low traffic volumes, and not at all for nodes with `MIXNODE_PEERS` unconfigured — this is a Loopix-inherited limitation, not a PARDA-specific one).
 - Anything visible at a node the GPA also controls (composing with §3.2).
-- The `recipient_id` of the *fetch* request against the relay (§3.1 receive-path gap).
+- The client's IP address at the moment of the leg-2 pull retrieval (`GET /v1/pulls/{rendezvous_token}`) — never `recipient_id` itself, which leg 2's token carries no derivable relationship to. See §3.1's Sub-Phase 4.5A paragraph.
 
 **What a GPA does NOT get, as long as ≥1 honest hop exists on the path, at the tested scale:**
-- A confirmed sender→receiver *entry/exit timing* pairing for a specific message, above the false-positive rate `mixnode/tests/timing_correlation_tests.rs` demonstrates via a permutation test (Spearman rank correlation between send-order and relay-arrival-order for the true pairing, tested against random re-pairings). This is an **empirical result bounded to the tested parameters** (10 flows, 3-hop paths, mean 150ms/hop delay in the checked-in test) — not a formal, asymptotic anonymity proof, and not automatically true at arbitrarily different traffic volumes, path lengths, or delay settings. Re-verify this test (or a scaled variant of it) before trusting a materially different production configuration.
+- A confirmed sender→receiver *entry/exit timing* pairing for a specific send, above the false-positive rate `mixnode/tests/timing_correlation_tests.rs` demonstrates via a permutation test (Spearman rank correlation between send-order and relay-arrival-order for the true pairing, tested against random re-pairings). This is an **empirical result bounded to the tested parameters** (8 flows, 3-hop paths, 250ms avg per-hop delay in the checked-in test) — not a formal, asymptotic anonymity proof, and not automatically true at arbitrarily different traffic volumes, path lengths, or delay settings. Re-verify this test (or a scaled variant of it) before trusting a materially different production configuration.
+- **(Sub-Phase 4.5A) The same guarantee, symmetrically, for a pull request's entry (client's Sphinx POST) vs. arrival (relay's `/v1/pulls` receipt).** `mixnode/tests/receive_timing_correlation_tests.rs::test_pull_request_entry_to_arrival_timing_does_not_leak_flow_pairing_above_chance` — identical permutation-test methodology, same parameters, same empirical/scale-bounded framing. This closes what was, until this sub-phase, the receive-path's open item in the property table below.
 
 **Explicitly out of scope, still:** full mix-network compromise (§4) — if every node is adversary-controlled, PARDA makes no anonymity claim, matching Loopix's own stated limits. Also out of scope: any adversary who obtains a live memory/packet capture of an honest mix node itself (distinct from network observation — see the physical-adversary considerations that Phase 3 will formalize for device seizure).
 
@@ -263,6 +268,80 @@ it covers:**
   full PIR was considered and rejected as disproportionate machinery for a
   single-hop intermittent mesh carrier model (design note §3).
 
+### 3.8 Active Identity-Substitution Adversary (Sub-Phase 4.5D — implemented and tested)
+
+An adversary who can substitute their own long-term identity key for a
+peer's, at any point where PARDA accepts one: a prekey bundle fetched
+from the relay, or the identity bound into a sealed-sender certificate.
+This is the classic active MITM, and before Sub-Phase 4.5D this project
+had **three separate, undocumented trust-on-first-use postures** with no
+way to distinguish "pinned because it was the first thing we saw" from
+"a human compared this and confirmed it."
+
+**What was already true, read from the code rather than assumed:**
+`store.rs`'s `IdentityKeyStore::is_trusted_identity` already pins on
+first use and already rejects a *later* different key for the same
+address (libsignal raises `UntrustedIdentity`). So this adversary never
+had a free hand mid-conversation. What was missing was any notion of
+verification, and any human-comparable fingerprint at all.
+
+**What Sub-Phase 4.5D adds, and its exact boundary:**
+
+- `parda_protocol::trust::Fingerprint` — HKDF-SHA256 over both parties'
+  serialized identity keys in sorted order (symmetric, so both sides
+  compute the same value), rendered as 60 decimal digits. **Inspired by
+  Signal's published safety-number concept; deliberately not
+  bit-compatible with Signal's own algorithm.** Re-deriving Signal's
+  iterated-SHA-512 construction from memory risked getting a
+  security-relevant detail subtly wrong while appearing authoritative;
+  using the HKDF primitive this codebase already uses twice, and saying
+  so, is the honest trade. PARDA fingerprints are only ever compared
+  against other PARDA fingerprints.
+- `TrustLevel::{Tofu, Verified}` with `TrustStore` as the persistence
+  seam (trait + in-memory impl, mirroring `clock_guard`'s split).
+  Absence of an entry *is* `Tofu` — no separate flag that can drift out
+  of sync with the fingerprint.
+- Enforcement at two of the three points, via **additive** wrappers
+  (`initiate_session_verified`, `decrypt_sealed_verified`) rather than
+  changes to the existing methods, so a caller that never adopts a
+  `TrustStore` provably behaves exactly as before.
+
+**Detected:** an identity-key substitution against a peer already marked
+`Verified` fails with `PardaError::IdentityKeyChangedAfterVerification`
+— a distinct error from libsignal's generic `UntrustedIdentity`, so a UI
+can present "the person you verified now has a different key" differently
+from an ordinary first-contact pin. On the prekey path the check runs
+*before* any session state is written (a rejected bundle leaves the store
+untouched, tested). On the sealed-sender path it necessarily runs *after*
+decryption — the sender's identity is not authenticated until the
+certificate chain validates, which is the entire point of sealed sender —
+but still before the plaintext is returned to the caller, so no caller
+can act on content from an unexpected identity. That is a narrower
+guarantee than "never decrypted at all," and it is the strongest
+available at that layer.
+
+**Not detected, and asserted as such under test:** a MITM present at
+*first* contact, before any out-of-band comparison, succeeds. This is the
+fundamental limit of trust-on-first-use — Signal included — and
+`protocol/tests/trust_bootstrapping_tests.rs::test_mitm_at_first_contact_succeeds_when_never_verified`
+exists specifically to keep that admission under test, so the claim
+cannot quietly strengthen without a test failing.
+
+**Also not addressed:** there is no verification UI. `TrustStore::record_verified`
+is the seam one would call; this phase ships none, so verification is
+reachable only from code. And mix-node key verification is a documented
+workflow, not an enforced control — `TrustStore` is keyed by an opaque
+peer ID and works unchanged for a mix node (tested), but no mixnode call
+site invokes it (§3.6).
+
+**Tested by:** `protocol/tests/trust_bootstrapping_tests.rs` (8 tests:
+MITM before and after verification on both the prekey and sealed-sender
+paths, honest-path non-regression, fail-closed session state, the
+legitimate-reinstall escape hatch, and the mix-node-shaped peer ID) plus
+`protocol/src/trust.rs`'s unit tests (fingerprint symmetry and
+distinctness, digit formatting, TOFU/Verified transitions). CI job:
+`trust-bootstrapping`.
+
 ---
 
 ## 4. Out of Scope (Current Phase)
@@ -270,19 +349,22 @@ it covers:**
 - **Quantum adversaries:** Post-quantum key encapsulation (ML-KEM) and signatures (ML-DSA) are planned for a future phase. The current design uses X25519 and Ed25519. (`libsignal-protocol`'s Kyber prekey storage trait is implemented as an unused stub — see `protocol/src/store.rs` — solely because the pinned library version requires it structurally; no PQXDH handshake is performed.)
 - **Full mix-network compromise:** PARDA does not claim anonymity if all nodes in a routing path are colluding (§3.6).
 - **IP-address anonymity for the client's connection to its first mix hop:** Sub-Phase 2B hides which mix node ultimately delivers to the relay, and hides content/routing from intermediate hops, but a GPA watching a specific client's network link still sees that client talking to *some* mix node. No Tor-style guard rotation or additional transport-layer anonymization is implemented.
-- **Receive-path (message fetch) anonymization:** unchanged from Phase 1/Sub-Phase 2A — see §3.1 and §3.6.
+- **Receive-path (message fetch) anonymization from an external GPA:** implemented, Sub-Phase 4.5A — see §3.1 and §3.6. Still out of scope: the leg-2 retrieval connection's IP-visibility to the relay itself (a residual, not a gap this sub-phase claims to close — see §3.1), and full Sphinx-SURB-based unlinkability (design note §1 explains why it was rejected as disproportionate to this sub-phase's mandate).
 - **Decentralized mix-node directory / topology authority:** `MixTopology` is static and trust-on-first-use, same posture as prekey bundle upload and sealed-sender certificate issuance (§3.5). No freshness, revocation, or Byzantine-fault-tolerant directory consensus exists.
 - **Endpoint compromise prior to message creation:** If the sending device is compromised before message composition, no protocol-level protection applies.
 - **Sealed-sender CA enrollment authentication:** see §3.5's trust-assumption paragraph.
 - **Acoustic / physical side-channel attacks**
-- **Denial-of-service resilience:** a mix node that receives a flood of malformed or excessive-volume packets has no rate limiting; a Sphinx-unwrap failure is rejected per-packet (fail closed) but nothing yet throttles an adversary who simply sends many packets.
 - **Raw radio-layer presence detection (Phase 4):** no software fix changes RF physics — see §3.7.
-- **Real CoreBluetooth (macOS/iOS), Android, and Windows mesh backends:** trait-ready (`parda_mesh::radio::MeshRadio`), not implemented this phase — see §3.7 and the README limitations table for the specific, cited restriction per platform.
+- **Real CoreBluetooth (macOS/iOS) and Windows mesh backends:** the iOS Swift bridge is written against the real CoreBluetooth API but has **never been compiled or run** (no macOS/Xcode exists in this environment, categorically) — treat it as a reviewed design sketch, not software. Windows is unimplemented. Android *is* implemented as of Sub-Phase 4.5B (`parda-mobile-bridge` + `MeshBridge.kt`) and verified as far as: cross-compiles for both Android ABIs, links into a real APK, loads on a real emulator without crashing. **BLE advertise/scan/connect were never exercised against real or emulated (rootcanal) radio, and the passive-scanner correlation test was never run against the Android backend** — see §3.7 and the README limitations table.
+- **Driving mesh mode from the mobile UI:** `MeshPlugin.kt` exposes `startMesh`/`stopMesh` and the manifest declares the Android 12+ runtime BLE permissions, but no Dart code requests those permissions or calls either method. The bridge is reachable in principle and dormant in practice.
+- **A user-facing identity-verification flow:** the trust mechanism is implemented and tested (§3.8), but nothing in any UI or CLI lets a human actually compare and confirm a fingerprint. `TrustStore::record_verified` is currently callable only from code.
 - **Real Wi-Fi Direct platform binding:** no viable Rust crate found for any target platform (checked, not assumed) — see §3.7.
 - **Full PIR/hidden-access-pattern retrieval:** considered (Talek, Cheng et al. ACSAC 2020) and rejected as disproportionate machinery for a single-hop intermittent mesh carrier model — see §3.7.2 and design note §3. Decoy queries are a narrower, measured mitigation, not a PIR-equivalent guarantee.
 - **Colluding-carrier retrieval-pattern correlation:** §3.7.2's measurement is against a single non-colluding logging carrier; a carrier that colludes with every other carrier a device ever polls through is a strictly stronger adversary not defeated by this phase's mitigation.
 - **Mesh flood/Sybil resistance against an attacker willing to reconnect indefinitely:** raised in cost, not eliminated — see §3.7.1. Building persistent-peer-identity infrastructure to rate-limit by identity was deliberately not done, since that infrastructure would itself be the tracking capability Sub-Phase 4A exists to avoid.
-- **Mobile (Flutter/Dart/Kotlin/Swift) mesh integration:** out of scope this phase, consistent with Phase 3's self-destruct mobile-UI deferral — no mesh-mode UI or native bridge exists yet.
+- **Denial-of-service resilience beyond the gateway edge:** Sub-Phase 4.5E adds a per-client token-bucket limiter to `parda-gateway` only. It is per-process and in-memory, so restarting resets every bucket and multiple instances behind a load balancer do not share state — it bounds casual abuse, not a distributed attacker. `parda-relay` and `parda-mixnode` remain unthrottled; a mix node still rejects malformed Sphinx packets per-packet (fail closed) but nothing limits an adversary who simply sends many well-formed ones.
+- **Transport security by default:** TLS is implemented and tested (`parda-tls`) but opt-in via `PARDA_TLS_ENABLED=1`; the default configuration still speaks plaintext HTTP, loudly warned at startup. With TLS on and no certificate configured, the generated self-signed certificate defeats a passive eavesdropper only, never an active MITM.
+- **Gateway authentication as user authentication:** the API-key mechanism authenticates an API *client*, not a person, and deliberately does not grow into an account system — that would create exactly the metadata concentration point the rest of this design avoids.
 - **On-device power/battery measurement:** `mesh/tests/battery_cost_tests.rs` measures operation counts and wire-byte sizes at this crate's actual parameters, not real milliwatt draw — no BLE hardware exists in the environment this phase was built in to measure that. See README limitations.
 
 ---
@@ -303,7 +385,8 @@ Every ✅ row below is backed by a named test a reviewer can run; nothing is mar
 | Envelope wire-format version mismatch fails loud | ✅ Implemented & tested | `protocol/tests/crypto_tests.rs::test_envelope_future_version_rejected_explicitly`, `::test_envelope_missing_version_defaults_to_v1` |
 | Relay store encrypted at rest | ✅ Implemented & tested — Sub-Phase 2A | `server/tests/persistence_tests.rs::test_database_file_is_not_plaintext_on_disk`, `::test_wrong_key_cannot_read_database` |
 | Relay store survives restart | ✅ Implemented & tested — Sub-Phase 2A | `server/tests/persistence_tests.rs::test_data_survives_simulated_restart` |
-| Sender-receiver unlinkability (receive/fetch path) | 🔲 Not implemented — see §3.1, §3.6, §4 | Not started |
+| Sender-receiver unlinkability (receive/fetch path) — leg 1 (mix-routed pull request) | ✅ Implemented & tested — Sub-Phase 4.5A | `mixnode/tests/receive_timing_correlation_tests.rs::test_pull_request_entry_to_arrival_timing_does_not_leak_flow_pairing_above_chance` (empirical, scale-bounded — see §3.6) |
+| Receive-path leg 2 (retrieval) reveals no `recipient_id` to the wire | ✅ Implemented & tested — Sub-Phase 4.5A | `mixnode/tests/receive_timing_correlation_tests.rs::test_pull_retrieval_leg_url_carries_no_recipient_identity` |
 | Time-bound self-destruct key derivation (HKDF-SHA256, local secret) | ✅ Implemented & tested — Sub-Phase 3A | `protocol/src/self_destruct.rs::tests::test_seal_open_roundtrip`, `::test_different_modes_derive_different_keys_from_the_same_seed` |
 | Self-destruct key provably erased from live process memory at expiry | ✅ Implemented & tested — Sub-Phase 3A | `protocol/src/self_destruct.rs::tests::test_erase_zeroizes_before_clearing_and_ends_up_gone`, `::linux_memory_scan_tests::test_key_bytes_absent_from_process_memory_after_expiry` (Linux only) |
 | Clock-rollback detection, fail-closed | ✅ Implemented & tested — Sub-Phase 3A | `protocol/src/clock_guard.rs::tests::test_rollback_is_detected_and_watermark_not_advanced`, `protocol/tests/self_destruct_tests.rs::test_clock_rollback_forces_fail_closed_and_permanently_expires_the_message` |
@@ -318,7 +401,7 @@ Every ✅ row below is backed by a named test a reviewer can run; nothing is mar
 | CLI prototype exercising full flow end-to-end (real HTTP transport, both destruct modes, burn) | ✅ Implemented & run — Sub-Phase 3D | `cli/src/main.rs` `demo` subcommand — run directly (not just `cargo test`) for all 3 modes plus the mutually-exclusive-flags rejection, all exiting as designed |
 | REST API gateway (typed, versioned, provably never touches plaintext/keys) | ✅ Implemented & tested — Sub-Phase 3D | `gateway/tests/gateway_tests.rs` (3/3, incl. `test_ciphertext_passes_through_bit_identical`) |
 | `DirectTransport`/`MixTransport::receive` correctly parses the relay's actual response shape | ✅ Fixed & tested — found via the Sub-Phase 3D CLI's first real run | `protocol/src/transport.rs` (`FetchMessagesResponse`); latent since Phase 1, no prior test exercised `receive()` against a live relay |
-| Self-destructing message surviving an app restart while pending | 🔲 Not implemented — deliberately excluded from `parda-client-store`, no replacement holding area built yet | Not started |
+| Self-destructing message surviving an app restart while pending | ✅ Implemented & tested — Sub-Phase 4.5E (opt-in; the derived key now touches disk — a real trade-off, see §3.4) | `client-store/tests/restart_survival_tests.rs` (10/10, incl. a real database file closed and reopened) |
 | No persistent radio-layer advertisement identifier | ✅ Implemented & tested — Sub-Phase 4A | `mesh/tests/passive_scanner_tests.rs` (all 3 tests, measured against random-guess baseline) |
 | Real BLE backend on at least one platform | ✅ Implemented — Sub-Phase 4A (Linux/`bluer` only; not compiled/run in this session — see §3.7) | `mesh/src/radio/bluez.rs`; compiled in CI's `mesh-adversarial` job, Linux leg, `--features bluez` |
 | DTN store-and-forward relay agent, RFC 9171 bundle framing | ✅ Implemented & tested — Sub-Phase 4B | `mesh/src/bundle.rs`, `mesh/tests/*` (bundle round-trip, opacity) |
@@ -333,9 +416,19 @@ Every ✅ row below is backed by a named test a reviewer can run; nothing is mar
 | Hybrid online/mesh handoff, no message loss/duplication across the transition | ✅ Implemented & tested — Sub-Phase 4D | `mesh/tests/hybrid_handoff_tests.rs` (2/2) |
 | Combined field scenario: real `MixTransport` + `MeshTransport` under `HybridTransport`, mixed with mesh-only messages | ✅ Implemented & tested — Sub-Phase 4D | `mesh/tests/combined_field_scenario_tests.rs` (2/2) |
 | Battery/resource cost characterized (operation counts, wire bytes) | ✅ Measured — Sub-Phase 4D (operation counts only, no on-device power draw — see §3.7 and README) | `mesh/tests/battery_cost_tests.rs` (3/3) |
-| Real CoreBluetooth (macOS/iOS), Android, Windows mesh backends | 🔲 Not implemented — documented gap, not stub code — see §3.7 | Not attempted, no toolchain in this environment |
+| Real Android BLE mesh backend (Rust↔JNI) | ⚠️ Implemented, partially verified — Sub-Phase 4.5B | `mobile-bridge/` + `MeshBridge.kt`; cross-compiles for both Android ABIs, links into a real APK, loads on a real emulator. **BLE never exercised against real/emulated radio; passive-scanner test never run against this backend** |
+| Real CoreBluetooth (macOS/iOS) mesh backend | ⚠️ Written, **never compiled, never run** — Sub-Phase 4.5C | `mobile/ios/Runner/CoreBluetoothMeshRadio.swift` — no macOS/Xcode exists in this environment, categorically. A reviewed design sketch, not software |
+| Real Windows mesh backend | 🔲 Not implemented — documented gap, not stub code — see §3.7 | Not attempted |
 | Real Wi-Fi Direct platform binding | 🔲 Not implemented — no viable Rust crate found for any platform | Not attempted |
-| Mobile (Flutter/Dart/Kotlin/Swift) mesh integration | 🔲 Out of scope this phase, same precedent as Phase 3's self-destruct mobile-UI deferral | Not attempted |
+| Mobile mesh integration (native bridge) | ⚠️ Bridge wired and building; **not driven from the Dart UI** — Sub-Phase 4.5B | `MeshPlugin.kt`, `MeshBridge.kt`, manifest BLE permissions. No Dart code requests permissions or calls `startMesh()` |
+| Decrypted plaintext held in a native zeroize-on-release buffer rather than a Dart `String` | ✅ Implemented & tested — Sub-Phase 4.5C (narrows the window to one render pass; does not eliminate it — see §3.4) | `protocol/src/plaintext_ffi.rs` (3 unit tests + a Linux `/proc/self/mem` canary test); `mobile-bridge/src/plaintext_exports.rs`; `mobile/lib/crypto/plaintext_handle.dart` |
+| Out-of-band identity verification detects a post-verification MITM | ✅ Implemented & tested — Sub-Phase 4.5D | `protocol/tests/trust_bootstrapping_tests.rs` (8/8, both prekey and sealed-sender paths) |
+| MITM at **first** contact — explicitly NOT defended (inherent to TOFU) | 🔲 Known, asserted limitation — Sub-Phase 4.5D, see §3.8 | `protocol/tests/trust_bootstrapping_tests.rs::test_mitm_at_first_contact_succeeds_when_never_verified` |
+| User-facing fingerprint-verification flow | 🔲 Not implemented — mechanism only, no UI/CLI — see §3.8 | Not attempted |
+| Combined "expire by T **or** on read" self-destruct mode | ✅ Implemented & tested — Sub-Phase 4.5E | `protocol/tests/self_destruct_tests.rs::test_combined_mode_*` (4 tests, both race orderings) |
+| TLS termination (native rustls) for relay / mix node / gateway | ✅ Implemented & tested — Sub-Phase 4.5E (opt-in; plaintext remains the default — see §4) | `tls/tests/tls_integration_tests.rs` (5/5, incl. a real TLS handshake and a check that plaintext is refused) |
+| Gateway API-key authentication + rate limiting | ✅ Implemented & tested — Sub-Phase 4.5E (opt-in; open by default — see §4) | `gateway/tests/auth_rate_limit_tests.rs` (8/8, incl. constant-time prefix rejection and per-key bucket isolation) |
+| Persistent mix-node identity across restarts | ✅ Implemented & tested — Sub-Phase 4.5E | `mixnode/src/identity.rs::tests` (stable across reloads, distinct per path, malformed file refused rather than overwritten) |
 | Post-quantum resistance | 🔲 Future (not in scope v0.x) | Not started |
 
 ---

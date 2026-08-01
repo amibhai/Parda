@@ -161,3 +161,139 @@ jobs:
       - name: cargo check -p parda-mesh --features bluez (Linux only)
         if: runner.os == 'Linux'
         run: cargo check -p parda-mesh --features bluez --verbose
+
+  # Sub-Phase 4.5A: the receive-path timing-correlation permutation test —
+  # this sub-phase's actual deliverable gate, per the same standard
+  # Sub-Phase 2B's send-path test and Phase 3's forensic-recovery tests
+  # were already held to. Isolated into its own job for the same reason:
+  # a statistical test that spins up real mix-node/relay daemons is
+  # slower and more sensitive to host scheduling noise than the fast unit
+  # suite, and should not be implicitly deprioritized by living inside it.
+  receive-path-anonymity:
+    name: receive-path timing correlation (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protoc + clang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Receive-path permutation test
+        run: cargo test -p parda-mixnode --test receive_timing_correlation_tests --verbose
+
+  # Sub-Phase 4.5D: the trust-bootstrapping MITM before/after tests —
+  # this sub-phase's actual deliverable gate. Isolated for the same
+  # reason forensic-recovery and receive-path-anonymity are: these are
+  # the proof of a specific security claim (see
+  # docs/phase4.5d-trust-bootstrapping-design.md §4), including the
+  # deliberately-asserted *limitation* that a MITM at first contact still
+  # succeeds, and should not be implicitly deprioritized by living only
+  # inside the general test job.
+  trust-bootstrapping:
+    name: trust bootstrapping MITM tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protoc + clang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: MITM before/after verification tests
+        run: cargo test -p parda-protocol --test trust_bootstrapping_tests --verbose
+
+      - name: Trust module unit tests (fingerprint symmetry, TOFU/Verified transitions)
+        # Quoted: an unquoted `trust:: ` is a YAML mapping-value indicator,
+        # not a test filter.
+        run: "cargo test -p parda-protocol --lib trust:: --verbose"
+
+  # Sub-Phase 4.5E: operational-hardening gates. Grouped into one job
+  # (rather than three) because unlike the jobs above these are not each
+  # a separate security *claim* — they are one set of hardening
+  # mechanisms whose tests share a runner cheaply. Still isolated from
+  # the general test job because the restart-survival suite writes real
+  # SQLCipher database files and the TLS suite performs real handshakes
+  # on real loopback sockets; both are slower and more environment-
+  # sensitive than the fast unit suite.
+  operational-hardening:
+    name: operational hardening (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protoc + clang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # Self-destruct restart survival. Needs parda-client-store's
+      # vendored SQLCipher/OpenSSL build, which requires a complete Perl
+      # for OpenSSL's Configure step — present on both GitHub-hosted
+      # runner images (see docs/phase1-architecture.md §11 for the
+      # dev-machine gap this documents).
+      - name: Self-destruct restart-survival tests
+        run: cargo test -p parda-client-store --test restart_survival_tests --verbose
+
+      - name: Combined-mode self-destruct tests
+        run: cargo test -p parda-protocol --test self_destruct_tests --verbose
+
+      # Real TLS handshakes against real loopback listeners — the reason
+      # native rustls termination was chosen over a reverse-proxy
+      # deployment note (see tls/src/lib.rs module docs).
+      - name: TLS termination integration tests
+        run: cargo test -p parda-tls --verbose
+
+      - name: Gateway auth + rate-limiting tests
+        run: cargo test -p parda-gateway --verbose
+
+      - name: Mix-node identity persistence tests
+        # Quoted for the same reason as the trust:: filter above.
+        run: "cargo test -p parda-mixnode --lib identity:: --verbose"

@@ -26,6 +26,7 @@
 //! inspected — see `routes.rs` module docs and
 //! `tests/gateway_tests.rs::test_ciphertext_passes_through_bit_identical`.
 
+pub mod auth;
 pub mod models;
 pub mod routes;
 
@@ -34,6 +35,8 @@ use axum::{
     Router,
 };
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
+
+pub use auth::ApiSecurity;
 
 #[derive(Clone)]
 pub struct GatewayState {
@@ -50,17 +53,40 @@ impl GatewayState {
     }
 }
 
+/// Build the gateway's Axum router with authentication and rate limiting
+/// disabled — the shape every pre-4.5E caller already used, preserved
+/// exactly so existing tests and callers are unaffected.
+///
+/// New code should prefer [`app_with_security`].
+pub fn app(state: GatewayState) -> Router {
+    app_with_security(state, ApiSecurity::new(Vec::new(), u32::MAX, f64::MAX))
+}
+
 /// Build the gateway's Axum router. Mirrors `parda_relay::app(store)` /
 /// `parda_mixnode::app(state)`'s pattern so tests can construct it
 /// without a real TCP bind.
-pub fn app(state: GatewayState) -> Router {
-    Router::new()
-        .route("/health", get(routes::health))
+///
+/// `/health` is deliberately **outside** the security layer: a liveness
+/// probe that requires a credential is a liveness probe that reports
+/// "down" whenever the credential is misconfigured, and it exposes
+/// nothing (it returns a fixed status, reads no state, and reaches no
+/// relay). Every `/api/v1/*` route is behind
+/// [`auth::api_security_middleware`].
+pub fn app_with_security(state: GatewayState, security: ApiSecurity) -> Router {
+    let api = Router::new()
         .route("/api/v1/keys/:user_id", post(routes::upload_prekey_bundle))
         .route("/api/v1/keys/:user_id", get(routes::get_prekey_bundle))
         .route("/api/v1/messages/:user_id", get(routes::fetch_messages))
         .route("/api/v1/messages/:user_id", post(routes::submit_message))
         .route("/api/v1/messages/:user_id/:msg_id", delete(routes::delete_message))
+        .layer(axum::middleware::from_fn_with_state(
+            security,
+            auth::api_security_middleware,
+        ));
+
+    Router::new()
+        .route("/health", get(routes::health))
+        .merge(api)
         .layer(TraceLayer::new_for_http())
         .layer(
             CorsLayer::new()

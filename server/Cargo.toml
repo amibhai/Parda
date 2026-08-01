@@ -23,6 +23,9 @@ tower-http     = { version = "0.5", features = ["trace", "cors"] }
 rusqlite       = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
 # Share envelope + prekey-bundle models with the protocol crate.
 parda-protocol = { path = "../protocol" }
+# Sub-Phase 4.5E: optional rustls TLS termination, shared with
+# parda-mixnode. See tls/src/lib.rs module docs.
+parda-tls      = { path = "../tls" }
 
 [dev-dependencies]
 axum-test     = "14"
