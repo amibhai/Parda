@@ -18,8 +18,9 @@
 //! | [`envelope`] | Wire message type, version byte, Phase 3 extension stub |
 //! | [`mixnet`] | Sphinx packet construction/processing (Sub-Phase 2B) |
 //! | [`transport`] | Transport abstraction — `DirectTransport`, `MixTransport` |
-//! | [`self_destruct`] | Time-bound self-destructing message primitive (Sub-Phase 3A) |
+//! | [`self_destruct`] | Time-bound and read-triggered self-destructing message primitive (Sub-Phases 3A/3B) |
 //! | [`clock_guard`] | Clock-rollback detection for self-destruct expiry (Sub-Phase 3A) |
+//! | [`secure_memory`] | Cross-platform `mlock`/`VirtualLock` to keep key material out of swap (Sub-Phase 3C) |
 //!
 //! ## Security Properties
 //!
@@ -52,6 +53,7 @@ pub mod error;
 pub mod identity;
 pub mod mixnet;
 pub mod sealed_sender;
+pub mod secure_memory;
 pub mod self_destruct;
 pub mod session;
 pub mod store;

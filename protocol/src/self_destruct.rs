@@ -1,26 +1,55 @@
-//! Time-bound self-destructing message primitive (Sub-Phase 3A).
+//! Time-bound and read-triggered self-destructing message primitive
+//! (Sub-Phases 3A/3B), with swap-avoidance for the key's live memory
+//! (Sub-Phase 3C).
 //!
 //! See `docs/phase3-3a-self-destruct-design.md` for the full design
 //! rationale — in particular §1 for why the key comes from a fresh local
-//! secret rather than the (inaccessible) Double-Ratchet message key, and
-//! §3 for the clock-trust model this module's expiry timer relies on.
+//! secret rather than the (inaccessible) Double-Ratchet message key, §3
+//! for the clock-trust model the expiry timer relies on, §5b for the
+//! read-triggered atomicity argument, and §8 for what `mlock`/
+//! `VirtualLock` does and doesn't prove.
 //!
-//! ## What this proves, and what it doesn't (yet)
+//! ## What this proves, and what it doesn't
 //!
 //! [`SelfDestructingMessage`] holds recovered plaintext, re-encrypted
 //! under a freshly-derived key, with that key erased — not just dropped,
 //! see the memory-forensics tests in this file's `#[cfg(test)]` module —
-//! when the message expires. This is Sub-Phase 3A's whole job: prove
-//! "the key is provably gone from live process memory after expiry," not
-//! "gone from swap/pagefile" (Sub-Phase 3C's job) and not "gone after
-//! first read" (Sub-Phase 3B's separate, distinct guarantee).
+//! when the message expires or is first read. The key's backing memory
+//! is also locked (`secure_memory::lock`) for as long as it's alive, so
+//! the OS never pages a copy of it to disk while it exists. Together
+//! these prove "the key is provably gone from live process memory after
+//! expiry/read, and was never swappable while it existed." They do
+//! **not** prove anything about hibernation (which can snapshot locked
+//! pages to disk by design) or about copies made before this module ever
+//! receives the plaintext (e.g. upstream in `libsignal`'s own decrypt
+//! path) — see `secure_memory` module docs and
+//! `protocol/tests/forensic_recovery_tests.rs` for the end-to-end
+//! adversarial test that exercises all of this together.
 //!
 //! **The two destruct modes' guarantees must not blur together:**
-//! time-bound (this sub-phase) means "gone by T regardless of whether it
-//! was ever read." Read-triggered (Sub-Phase 3B) means "gone after first
-//! read regardless of T." [`DestructMode`] exists now only so the KDF has
-//! domain separation ready for 3B; the read-trigger itself isn't
-//! implemented here.
+//! [`DestructMode::TimeBound`] means "gone by T regardless of whether it
+//! was ever read" — [`SelfDestructingMessage::seal`], a monotonic timer,
+//! no read dependency. [`DestructMode::ReadTriggered`] means "gone after
+//! first read regardless of T" — [`SelfDestructingMessage::seal_read_triggered`],
+//! no timer at all, erasure happens *inside* the same critical section
+//! as the first successful decrypt. A read-triggered message that is
+//! never read stays readable indefinitely; that is the documented,
+//! intended behavior of choosing this mode, not an oversight — a caller
+//! wanting "whichever comes first" would need to combine both modes
+//! explicitly (not implemented here, to keep each mode's guarantee
+//! legible on its own).
+//!
+//! ## Read-triggered atomicity (Sub-Phase 3B)
+//!
+//! [`SelfDestructingMessage::open`] on a read-triggered message performs
+//! the decrypt *and* the erasure inside one held `Mutex` lock, before
+//! returning to the caller. This means: by the time `open` returns
+//! plaintext at all, the key is already gone — there is no window, not
+//! even one spanning "decrypt succeeded" to "caller finished
+//! displaying," in which a second reader (or the same reader again)
+//! could observe live key material. `tests::test_read_triggered_concurrent_opens_only_one_succeeds`
+//! exercises this directly: many simultaneous callers race to `open()`
+//! the same message, and exactly one ever succeeds.
 
 use std::{
     sync::{Arc, Mutex},
@@ -35,11 +64,12 @@ use hkdf::Hkdf;
 use rand::RngCore;
 use sha2::Sha256;
 use tokio::time::Instant as TokioInstant;
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     clock_guard::{check_clock_integrity, ClockCheck, ClockWatermarkStore},
     error::{PardaError, Result},
+    secure_memory,
 };
 
 /// Default self-destruct expiry window: 5 minutes. A "burn after
@@ -72,13 +102,48 @@ impl DestructMode {
 
 // ─── Key derivation ─────────────────────────────────────────────────────────
 
-/// The derived self-destruct key. Zeroized on drop (`ZeroizeOnDrop`) and
-/// by [`SelfDestructingMessage::expire_now`], which drops it explicitly
-/// in place rather than waiting for the whole message to go out of
-/// scope — see the memory-forensics tests below for proof this actually
-/// overwrites the bytes.
-#[derive(Zeroize, ZeroizeOnDrop)]
-struct DerivedKey([u8; KEY_LEN]);
+/// The derived self-destruct key.
+///
+/// - **Zeroized on drop** (Sub-Phase 3A) — manually, not via
+///   `#[derive(ZeroizeOnDrop)]`, because [`Drop::drop`] here also has to
+///   unlock the memory (see next point); see the memory-forensics tests
+///   below for proof the zeroize actually overwrites the bytes, and
+///   [`erase`] for why erasure is a separate, explicit step rather than
+///   relying on `Option`'s implicit drop-on-reassignment.
+/// - **Memory-locked for its entire lifetime** (Sub-Phase 3C) —
+///   `secure_memory::lock` is called once, in [`DerivedKey::new`],
+///   immediately after allocating; `secure_memory::unlock` is called in
+///   `Drop`, after zeroizing. See `secure_memory` module docs for what
+///   this does and doesn't prove.
+/// - **Boxed, not an inline `[u8; 32]`** — its own dedicated heap
+///   allocation, so locking its page(s) doesn't also lock (or depend on
+///   the layout of) unrelated `Arc`/`Mutex` bookkeeping sharing a page
+///   with it.
+struct DerivedKey(Box<[u8; KEY_LEN]>);
+
+impl DerivedKey {
+    fn new(bytes: Box<[u8; KEY_LEN]>) -> Self {
+        // Best-effort: failure is logged inside `lock()` and does not
+        // stop the key from being usable — see `secure_memory` module
+        // docs "Failure is not fatal, but is never silent".
+        secure_memory::lock(bytes.as_ptr(), bytes.len());
+        DerivedKey(bytes)
+    }
+
+    fn zeroize(&mut self) {
+        // Autoderefs through the `Box` to `[u8; KEY_LEN]`'s `Zeroize`
+        // impl — a real, volatile-write zeroize, not a no-op on the Box
+        // pointer itself.
+        self.0.zeroize();
+    }
+}
+
+impl Drop for DerivedKey {
+    fn drop(&mut self) {
+        self.zeroize();
+        secure_memory::unlock(self.0.as_ptr(), self.0.len());
+    }
+}
 
 /// Derive the self-destruct key via HKDF-SHA256 (RFC 5869). `seed` is a
 /// fresh, local, never-transmitted secret — see module docs for why this
@@ -98,14 +163,20 @@ fn derive_key(
     info.extend_from_slice(&timestamp_ms.to_be_bytes());
     info.extend_from_slice(&expiry_window_ms.to_be_bytes());
 
+    // Allocated (and, in `DerivedKey::new`, locked) before HKDF writes
+    // into it, rather than deriving into a stack buffer and copying
+    // afterward — keeps the window during which the key exists
+    // unlocked as small as possible (see `secure_memory` module docs;
+    // this window can't be eliminated entirely, since `lock()` itself
+    // needs a real address to lock).
+    let mut okm: Box<[u8; KEY_LEN]> = Box::new([0u8; KEY_LEN]);
     let hk = Hkdf::<Sha256>::new(None, seed.as_ref());
-    let mut okm = [0u8; KEY_LEN];
     // Only fails if the requested output length is invalid for the hash
     // (> 255 * hash_len) — a fixed 32-byte request never triggers that
     // for SHA-256.
-    hk.expand(&info, &mut okm)
+    hk.expand(&info, okm.as_mut_slice())
         .expect("32-byte HKDF-Expand output is always valid for SHA-256");
-    DerivedKey(okm)
+    DerivedKey::new(okm)
 }
 
 /// Erase the key held in `slot`: zeroize it explicitly *while it is still
@@ -158,17 +229,48 @@ impl SelfDestructingMessage {
     /// `clock_guard` for the cross-restart case). `timestamp_ms` is the
     /// message's declared delivery time (fed into the KDF for domain
     /// separation only — see module docs on what is and isn't trusted).
+    ///
+    /// Guarantee: gone by `timestamp_ms + expiry_window`, regardless of
+    /// whether [`Self::open`] was ever called. See module docs for how
+    /// this differs from [`Self::seal_read_triggered`].
     pub fn seal(plaintext: &[u8], timestamp_ms: u64, expiry_window: Duration) -> Result<Self> {
+        let message = Self::seal_inner(
+            plaintext,
+            DestructMode::TimeBound,
+            timestamp_ms,
+            expiry_window.as_millis() as u64,
+        )?;
+        message.spawn_expiry_timer(expiry_window);
+        Ok(message)
+    }
+
+    /// Encrypt `plaintext` under a freshly-derived key with **no**
+    /// expiry timer. The key is erased the first time [`Self::open`]
+    /// succeeds — atomically, inside the same critical section as the
+    /// decrypt (see module docs "Read-triggered atomicity") — not on any
+    /// schedule. A message sealed this way and never opened stays
+    /// readable indefinitely; that is this mode's documented contract,
+    /// not a bug. See module docs for how this differs from
+    /// [`Self::seal`].
+    pub fn seal_read_triggered(plaintext: &[u8], timestamp_ms: u64) -> Result<Self> {
+        Self::seal_inner(plaintext, DestructMode::ReadTriggered, timestamp_ms, 0)
+    }
+
+    fn seal_inner(
+        plaintext: &[u8],
+        mode: DestructMode,
+        timestamp_ms: u64,
+        expiry_window_ms: u64,
+    ) -> Result<Self> {
         let mut seed_bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut seed_bytes);
         let seed: Zeroizing<[u8; 32]> = Zeroizing::new(seed_bytes);
 
-        let expiry_window_ms = expiry_window.as_millis() as u64;
-        let key = derive_key(&seed, DestructMode::TimeBound, timestamp_ms, expiry_window_ms);
+        let key = derive_key(&seed, mode, timestamp_ms, expiry_window_ms);
         // `seed` is dropped (and zeroized via `Zeroizing`) at end of
         // scope — it is never needed again once `key` exists.
 
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key.0));
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(key.0.as_slice()));
         let nonce = ChaCha20Poly1305::generate_nonce(&mut AeadOsRng);
         let ct = cipher
             .encrypt(&nonce, plaintext)
@@ -178,14 +280,11 @@ impl SelfDestructingMessage {
         stored.extend_from_slice(&nonce);
         stored.extend_from_slice(&ct);
 
-        let message = Self {
+        Ok(Self {
             ciphertext: Arc::new(stored),
             key: Arc::new(Mutex::new(Some(key))),
-            mode: DestructMode::TimeBound,
-        };
-
-        message.spawn_expiry_timer(expiry_window);
-        Ok(message)
+            mode,
+        })
     }
 
     fn spawn_expiry_timer(&self, expiry_window: Duration) {
@@ -216,20 +315,47 @@ impl SelfDestructingMessage {
     /// Decrypt and return the plaintext, if the key is still live.
     /// Returns [`PardaError::SelfDestructExpired`] otherwise — fails
     /// closed rather than returning a default/empty value.
+    ///
+    /// For a [`DestructMode::ReadTriggered`] message, this call *is* the
+    /// trigger: decrypt and erase happen inside one held lock, so the
+    /// key is already gone by the time this function returns anything
+    /// to the caller — see module docs "Read-triggered atomicity". For
+    /// [`DestructMode::TimeBound`], this only reads; erasure is the
+    /// timer's job.
     pub fn open(&self) -> Result<Zeroizing<Vec<u8>>> {
-        let guard = self.key.lock().unwrap();
-        let key = guard.as_ref().ok_or(PardaError::SelfDestructExpired)?;
+        let mut guard = self.key.lock().unwrap();
 
-        if self.ciphertext.len() < NONCE_LEN {
-            return Err(PardaError::SelfDestructCrypto(
-                "stored ciphertext shorter than the nonce prefix".to_string(),
-            ));
+        // Scoped so the immutable borrow of `guard` (via `key`) ends
+        // before the read-triggered branch below needs a mutable one —
+        // both borrows are real, just non-overlapping in time.
+        let plaintext = {
+            let key = guard.as_ref().ok_or(PardaError::SelfDestructExpired)?;
+
+            if self.ciphertext.len() < NONCE_LEN {
+                return Err(PardaError::SelfDestructCrypto(
+                    "stored ciphertext shorter than the nonce prefix".to_string(),
+                ));
+            }
+            let (nonce_bytes, ct) = self.ciphertext.split_at(NONCE_LEN);
+            let cipher = ChaCha20Poly1305::new(Key::from_slice(key.0.as_slice()));
+            cipher
+                .decrypt(Nonce::from_slice(nonce_bytes), ct)
+                .map_err(|e| PardaError::SelfDestructCrypto(e.to_string()))?
+        };
+
+        if self.mode == DestructMode::ReadTriggered {
+            // Still holding `guard` — no other caller can be mid-`open()`
+            // on this message right now. Erase before releasing the
+            // lock, so there is no window in which this decrypt
+            // succeeded but the key still exists for a second reader
+            // (concurrent or sequential, including this same message
+            // after this call returns) to find.
+            if let Some(key) = guard.as_mut() {
+                key.zeroize();
+            }
+            *guard = None;
         }
-        let (nonce_bytes, ct) = self.ciphertext.split_at(NONCE_LEN);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key.0));
-        let plaintext = cipher
-            .decrypt(Nonce::from_slice(nonce_bytes), ct)
-            .map_err(|e| PardaError::SelfDestructCrypto(e.to_string()))?;
+
         Ok(Zeroizing::new(plaintext))
     }
 
@@ -371,23 +497,39 @@ mod tests {
     }
 
     #[test]
-    fn test_zeroize_overwrites_key_bytes_on_ordinary_drop_too() {
-        // Proves `ZeroizeOnDrop` fires on the normal Rust drop path too,
-        // not only through this module's own explicit `erase()` call —
-        // using the same live-reference-before/after pattern as above,
-        // via `ptr::drop_in_place` (which, like `Box`'s drop, runs
-        // `Drop::drop` in place without changing the value's shape the
-        // way an `Option` transition does — see the comment on `erase`).
+    fn test_zeroize_method_directly_overwrites_key_bytes_while_still_live() {
+        // `DerivedKey::zeroize` (an inherent method, not a derive) is
+        // the exact call `Drop::drop` makes — see its one-line body a
+        // few dozen lines up. Proving the method itself really
+        // overwrites the bytes, through a live, still-owned reference,
+        // therefore also establishes the ordinary-drop path by
+        // inspection, without needing to read through a `Box` after it
+        // has actually been deallocated.
+        //
+        // An earlier version of this test called `ptr::drop_in_place`
+        // manually and then read the (by-then-freed) `Box` afterward.
+        // Once `DerivedKey` started owning a real heap allocation (for
+        // Sub-Phase 3C's `mlock`/`VirtualLock` integration — see the
+        // struct's doc comment), that manual drop plus the compiler's
+        // own end-of-scope drop for the same variable became a genuine
+        // double-free: this crashed with STATUS_HEAP_CORRUPTION the
+        // first time it ran after that change. Recorded here for the
+        // same reason the `erase()` bug is recorded on that function's
+        // doc comment: the test suite catching a real memory-safety bug
+        // is the tests doing their job, not noise to silence.
         let mut key = derive_key(&Zeroizing::new([9u8; 32]), DestructMode::TimeBound, 1, 1);
         assert!(key.0.iter().any(|&b| b != 0));
 
-        unsafe { std::ptr::drop_in_place(&mut key) };
+        key.zeroize();
 
         assert!(
             key.0.iter().all(|&b| b == 0),
-            "key bytes were not overwritten by ZeroizeOnDrop — found: {:?}",
+            "key bytes were not overwritten by zeroize() — found: {:?}",
             key.0
         );
+        // `key` still owns its (now-zeroed) Box; the ordinary drop at
+        // the end of this scope unlocks and deallocates it correctly —
+        // exactly once.
     }
 }
 

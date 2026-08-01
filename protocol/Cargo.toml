@@ -40,6 +40,16 @@ sha2 = "0.10"
 # that happen to use one.
 tokio       = { workspace = true, features = ["full"] }
 
+[target.'cfg(unix)'.dependencies]
+# Sub-Phase 3C: mlock/munlock for secure_memory. Raw libc FFI to an OS
+# syscall, not a crypto primitive — no relation to the no-custom-crypto
+# constraint.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Sub-Phase 3C: VirtualLock/VirtualUnlock for secure_memory.
+windows-sys = { version = "0.59", features = ["Win32_System_Memory", "Win32_Foundation"] }
+
 [dev-dependencies]
 tokio-test  = "0.4"
 
