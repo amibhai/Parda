@@ -269,6 +269,7 @@ fn test_envelope_json_roundtrip() {
         sealed_sender: false,
         routing_hint: None,
         self_destruct_at: None,
+        read_triggered_destruct: false,
     };
 
     let json = serde_json::to_string(&envelope).expect("serialise envelope");
@@ -303,6 +304,7 @@ fn test_envelope_missing_version_defaults_to_v1() {
         sealed_sender: false,
         routing_hint: None,
         self_destruct_at: None,
+        read_triggered_destruct: false,
     };
     let mut value = serde_json::to_value(&modern).expect("serialise envelope");
     value
@@ -333,6 +335,7 @@ fn test_envelope_future_version_rejected_explicitly() {
         sealed_sender: false,
         routing_hint: None,
         self_destruct_at: None,
+        read_triggered_destruct: false,
     };
 
     let err = from_the_future

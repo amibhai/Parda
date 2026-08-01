@@ -74,6 +74,21 @@ impl SessionManager {
         Self { local_address, store }
     }
 
+    /// "Burn this conversation" with `remote_address` (Sub-Phase 3D).
+    /// Session-level destruct, distinct from — and with a materially
+    /// weaker erasure guarantee than — message-level self-destruct
+    /// (`crate::self_destruct`). See
+    /// `crate::store::InMemorySignalProtocolStore::burn_session`'s doc
+    /// comment for exactly what is and isn't proven, and why.
+    ///
+    /// After this call, `encrypt`/`decrypt` against `remote_address`
+    /// behave as if no session had ever been established — a fresh
+    /// `initiate_session`/incoming PreKey message is required before
+    /// this conversation can resume.
+    pub fn burn_conversation(&self, remote_address: &ProtocolAddress) -> crate::store::SessionBurnResult {
+        self.store.burn_session(remote_address)
+    }
+
     /// Initiate a session with a remote peer using their [`PreKeyBundle`].
     ///
     /// Must be called before the first `encrypt` to a new peer.
@@ -135,8 +150,11 @@ impl SessionManager {
             // ── Phase 2 (not used on this path — see `encrypt_sealed`) ──
             sealed_sender: false,
             routing_hint: None,
-            // ── Phase 3 stub ──
+            // Not self-destructing by default — callers opt in via
+            // `MessageEnvelope::with_self_destruct` /
+            // `::with_read_triggered_destruct` on the returned envelope.
             self_destruct_at: None,
+            read_triggered_destruct: false,
         })
     }
 
@@ -177,6 +195,7 @@ impl SessionManager {
             sealed_sender: true,
             routing_hint: None,
             self_destruct_at: None,
+            read_triggered_destruct: false,
         })
     }
 

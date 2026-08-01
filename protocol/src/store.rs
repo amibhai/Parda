@@ -127,6 +127,68 @@ impl InMemorySignalProtocolStore {
         self.state.borrow_mut().signed_prekeys.insert(id, record.clone());
         Ok(())
     }
+
+    /// "Burn this conversation" (Sub-Phase 3D): deliberately remove every
+    /// piece of session and trust state this store holds for `address`.
+    ///
+    /// **Read this before treating `burn_session` as equivalent to
+    /// [`crate::self_destruct`]'s guarantees — it is not, and the brief
+    /// this project follows is explicit that the two must not be
+    /// conflated.** `self_destruct::SelfDestructingMessage` provably
+    /// zeroizes its key material (`protocol/src/self_destruct.rs`'s
+    /// memory-forensics tests). `burn_session` cannot make that claim,
+    /// for a reason outside this crate's control: `libsignal-protocol`
+    /// v0.66.0's `SessionRecord` and the `PrivateKey` type underneath
+    /// `IdentityKeyPair` are ordinary, non-zeroizing Rust values — in
+    /// fact `PrivateKey` is `#[derive(Clone, Copy, ...)]` wrapping a
+    /// plain `[u8; 32]` (confirmed by reading
+    /// `rust/core/src/curve.rs` in the pinned `v0.66.0` tag), which
+    /// means libsignal's own internals may hold an unknown number of
+    /// implicit stack/register copies that no amount of care on PARDA's
+    /// side can enumerate or overwrite. Reaching into libsignal to force
+    /// zeroization there would mean forking or patching it — reopening
+    /// the same no-custom-crypto risk `docs/phase1-architecture.md` §2
+    /// already rejected once, for the same reason it was rejected for
+    /// Sub-Phase 3A's KDF (see `docs/phase3-3a-self-destruct-design.md`
+    /// §1).
+    ///
+    /// **What `burn_session` actually, provably does** (see
+    /// `protocol/tests/session_burn_tests.rs`): removes the session
+    /// record and trusted-identity entry for `address` from this store's
+    /// own `HashMap`s, so every subsequent operation through the normal
+    /// API — `SessionManager::encrypt`/`decrypt`, `load_session` — behaves
+    /// exactly as if no conversation with `address` had ever existed.
+    /// This is a real, tested, load-bearing guarantee (the conversation
+    /// is unusable, not just "marked burned") — it is just a *narrower*
+    /// one than byte-level erasure, and the narrowing is documented here
+    /// rather than left for a reader to assume away.
+    pub fn burn_session(&self, address: &ProtocolAddress) -> SessionBurnResult {
+        let mut state = self.state.borrow_mut();
+        let addr_str = address.to_string();
+        SessionBurnResult {
+            session_removed: state.sessions.remove(&addr_str).is_some(),
+            identity_trust_removed: state.trusted_identities.remove(&addr_str).is_some(),
+        }
+    }
+
+    /// `true` if this store still holds a session record or trusted
+    /// identity for `address` — i.e. `burn_session` has not (yet) been
+    /// called for it, or it was never established.
+    pub fn has_conversation_state(&self, address: &ProtocolAddress) -> bool {
+        let state = self.state.borrow();
+        let addr_str = address.to_string();
+        state.sessions.contains_key(&addr_str) || state.trusted_identities.contains_key(&addr_str)
+    }
+}
+
+/// What [`InMemorySignalProtocolStore::burn_session`] actually removed.
+/// Both `false` means there was nothing to burn — not necessarily an
+/// error, but worth a caller being able to distinguish from "burned
+/// something real."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionBurnResult {
+    pub session_removed: bool,
+    pub identity_trust_removed: bool,
 }
 
 // ─── SessionStore ─────────────────────────────────────────────────────────────
