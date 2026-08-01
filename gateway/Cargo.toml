@@ -1,0 +1,27 @@
+[package]
+name        = "parda-gateway"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+description = "PARDA REST API gateway — typed, versioned external HTTP contract in front of parda-relay (Sub-Phase 3D)"
+
+# Deliberately does NOT depend on the parda-relay crate directly — this
+# talks to a running relay over real HTTP (reqwest), the same way any
+# external client would. That keeps this crate's own build free of
+# parda-relay's vendored-SQLCipher/OpenSSL build requirement (see
+# server/src/store.rs module docs for that build prerequisite), and is
+# also a more honest shape for a "gateway": it fronts the relay as a
+# separate service, not as embedded library code.
+[dependencies]
+axum           = { version = "0.7", features = ["json", "macros"] }
+tokio          = { workspace = true, features = ["full"] }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+tracing        = { workspace = true }
+tracing-subscriber = { workspace = true }
+tower-http     = { version = "0.5", features = ["trace", "cors"] }
+reqwest        = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# For typed request/response validation only (MessageEnvelope shape) —
+# not for any crypto operation. See lib.rs module docs.
+parda-protocol = { path = "../protocol" }
+
