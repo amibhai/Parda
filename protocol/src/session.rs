@@ -155,6 +155,7 @@ impl SessionManager {
             // `::with_read_triggered_destruct` on the returned envelope.
             self_destruct_at: None,
             read_triggered_destruct: false,
+            dead_drop_address: None,
         })
     }
 
@@ -196,6 +197,7 @@ impl SessionManager {
             routing_hint: None,
             self_destruct_at: None,
             read_triggered_destruct: false,
+            dead_drop_address: None,
         })
     }
 

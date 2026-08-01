@@ -96,6 +96,7 @@ fn test_envelope(recipient_id: &str) -> MessageEnvelope {
         routing_hint: None,
         self_destruct_at: None,
         read_triggered_destruct: false,
+        dead_drop_address: None,
     }
 }
 

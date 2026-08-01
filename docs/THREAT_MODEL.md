@@ -1,6 +1,6 @@
 # PARDA Threat Model
 
-**Status:** Finalized for Phase 1 + Sub-Phase 2A + Sub-Phase 2B — v0.3.0 | Last updated: 2026-07-31
+**Status:** Finalized for Phase 1 + Sub-Phase 2A + Sub-Phase 2B + Phase 3 (3A-3D) + Phase 4 (4A-4D) — v0.4.0 | Last updated: 2026-08-01
 
 ---
 
@@ -115,6 +115,154 @@ This section states what Sphinx packet path-length, per-hop delay, and cover-tra
 
 **Explicitly out of scope, still:** full mix-network compromise (§4) — if every node is adversary-controlled, PARDA makes no anonymity claim, matching Loopix's own stated limits. Also out of scope: any adversary who obtains a live memory/packet capture of an honest mix node itself (distinct from network observation — see the physical-adversary considerations that Phase 3 will formalize for device seizure).
 
+### 3.7 Co-located Radio Adversary (Phase 4, implemented)
+
+An adversary **physically present in BLE/Wi-Fi range** during an active mesh
+session — a passive scanner logging every advertisement and connection it
+observes, or an active participant who joins the mesh as a store-and-forward
+carrier (§3.7.1 below). This is a materially different adversary from every
+one above: §3.1-§3.6 assume the adversary observes a network link or
+compromises a host; this one observes **radio spectrum directly**, which no
+software running on PARDA's endpoints can hide the existence of. Stated
+plainly, once, rather than qualified away in each subsection below: **a
+broadcast radio is a broadcast radio — no key management scheme changes RF
+physics, and PARDA does not claim otherwise.**
+
+**What is defended, precisely:**
+- **No persistent radio-layer identifier.** `parda_mesh::radio::AdvertToken`
+  is fresh `OsRng` bytes plus a fixed, public 2-byte protocol tag — nothing
+  else is ever advertised (no device name, no per-device service UUID).
+  `parda_mesh::radio::RotatingIdentity` draws a new token every
+  `DEFAULT_ROTATION_INTERVAL` (120s, a threat-model parameter, not a
+  hardcoded floor). `mesh/tests/passive_scanner_tests.rs` proves, measured
+  against a random-guess baseline (not just asserted zero): no two
+  advertisements from the same simulated device across different rotation
+  windows are bit-identical (`full_token_adversary_finds_zero_cross_window_links_at_128_bits`),
+  and even a drastically weakened partial-byte signal doesn't beat chance
+  (`one_byte_prefix_adversary_does_not_beat_random_guess_baseline_by_more_than_margin`).
+- **Store-and-forward carrier opacity.** `parda_mesh::relay::MeshRelayAgent`
+  indexes bundles by a blinded address only (§3.7.2) and never decodes a
+  bundle's payload block into a `MessageEnvelope`. `mesh/tests/malicious_carrier_tests.rs::malicious_carrier_cannot_recover_any_known_marker_from_raw_storage`
+  gives a simulated adversary **direct access to its own raw backing store**
+  (not the relay's own query API — a real attacker with the device wouldn't
+  be limited to it either) holding a corpus of known plaintext/identity
+  markers, and proves none is recoverable.
+- **Flood/Sybil resistance.** Because Sub-Phase 4A deliberately gives peers
+  no stable identity across sessions (the property directly above), classic
+  per-identity rate limiting doesn't apply — `mesh/src/relay.rs` module docs
+  explain why the actual defense is a hard global storage cap plus a small
+  per-connection-session admission cap instead, raising the cost of flooding
+  without claiming to eliminate it for an attacker willing to reconnect
+  repeatedly. `mesh/tests/flood_resistance_tests.rs` proves storage stays
+  bounded under a direct flood, under a single oversized sync session, and
+  that a flood cannot evict already-stored honest bundles.
+- **Mesh partition/rejoin correctness.** `mesh/tests/partition_rejoin_tests.rs`
+  proves no duplicated or dropped bundle across a partition-and-heal cycle,
+  including a two-path rejoin scenario and a carrier that goes offline mid-mesh
+  while still holding an in-flight bundle. `mesh/tests/multinode_simulation_tests.rs`
+  runs the same underlying mechanism at N=30 nodes on a ring topology under a
+  fixed churn schedule, not just two-node cases.
+- **Retrieval-pattern mitigation, measured.** See §3.7.2.
+- **Self-destruct still fires under mesh latency.** `mesh/tests/expiry_tests.rs`
+  proves a bundle that expires before pickup is purged and never delivered,
+  and that a partition delaying delivery past the deadline produces the same
+  outcome (not a race that sometimes delivers anyway).
+
+**What is NOT defended — stated directly, not implied away:**
+- **Raw presence detection.** An observer with a BLE/Wi-Fi scanner in
+  physical range learns *that a PARDA node is active nearby, right now* —
+  this is unavoidable and inherent to using broadcast radio at all, not a
+  gap specific to this implementation. Rotation defeats *re-identifying the
+  same device across two separate encounters*; it does not and cannot defeat
+  *detecting a device is present during one encounter*.
+- **Platform MAC/link-layer address rotation is outside application
+  control on every platform researched.** iOS hides the underlying address
+  from apps entirely (assigns a random per-app `CBPeripheral` UUID instead)
+  and rotates the real address at the OS level on its own ~15-minute
+  schedule, with zero app-level control. Android's address-randomization
+  behavior is OS/manufacturer policy (observed absent on some Samsung
+  devices in prior research), also with no fine-grained app control.
+  Linux/BlueZ's resolvable-private-address rotation is a kernel/`bluetoothd`
+  privacy-subsystem setting, not something `parda_mesh::radio::bluez` drives
+  per advertisement. What this project's code controls — and the only thing
+  [`AdvertToken`] rotation actually claims to control — is the *advertised
+  payload*, not the underlying radio link-layer address. See
+  `mesh/src/radio/mod.rs` module docs and the README limitations table.
+- **Real backends exist for exactly one platform.** `bluer`/BlueZ (Linux)
+  is the one real, compiling backend this phase ships. CoreBluetooth
+  (macOS/iOS), Android, and Windows are documented, cited gaps — trait-ready,
+  not implemented — not stub code that pretends to work. No GitHub-hosted CI
+  runner has a Bluetooth radio either, so even the real backend's
+  `advertise`/`scan`/`connect`/`accept` are never exercised against actual RF
+  in CI — see `mesh/src/radio/bluez.rs` module docs.
+- **No real Wi-Fi Direct platform binding.** No viable Rust crate for Wi-Fi
+  Direct was found for any target platform (checked, not assumed) — the
+  large-bundle-transfer path is proven at the protocol level via
+  `SimulatedMeshRadio`'s `SimProfile::WifiDirect` profile only.
+- **Cross-poll recurrence of a still-pending address is not hidden by
+  decoy queries** — a genuine, measured limitation, not a qualitative
+  aside. See §3.7.2.
+
+#### 3.7.1 Malicious/Sybil relay-agent adversary (implemented, bounded not eliminated)
+
+An adversary running one or more `parda_mesh::relay::MeshRelayAgent`
+instances (or one physical radio presenting many rotating identities) that
+floods garbage bundles or attempts to exhaust an honest carrier's storage.
+Same evidence as the flood/Sybil bullet above.
+**Explicitly not eliminated:** an attacker willing to physically reconnect
+repeatedly can still consume the global cap over enough sessions — the
+per-session admission cap raises the real-world (time/energy) cost of doing
+so, it does not make it impossible, because this project deliberately does
+not build the persistent-identity infrastructure that would be needed to
+rate-limit by identity instead (that infrastructure would itself be a
+tracking capability, which Sub-Phase 4A exists specifically to avoid).
+
+#### 3.7.2 Dead-drop addressing and retrieval-pattern adversary (implemented, scoped)
+
+Covers `parda_protocol::dead_drop` (the blinded addressing construction) and
+the decoy-query retrieval-pattern mitigation — both designed in
+`docs/phase4-4c-dead-drop-addressing-design.md`, reviewed before
+implementation per this phase's own required process.
+
+**Address blinding:** a bundle's storage address
+(`dead_drop::TagKey::address_for`) is an HKDF-SHA256 output derived from a
+dedicated, purpose-only X25519 keypair per conversation (never the Signal
+identity key, never reachable from inside the Double Ratchet session — see
+design note §1) and a monotonic per-peer counter (not wall-clock time, to
+avoid re-importing Phase 3's clock-trust gaps — design note §2). A carrier
+observing the address alone learns nothing about recipient identity;
+`mesh/tests/malicious_carrier_tests.rs::destination_address_reveals_nothing_without_the_key`
+and `retrieval_pattern_tests.rs::distinct_indices_do_not_spuriously_share_addresses`
+cover this directly.
+
+**Retrieval-pattern mitigation — measured, with an honest boundary on what
+it covers:**
+- **What decoy queries prove, measured:** given a *single* poll batch in
+  isolation, an adversary cannot identify the real address among `k-1`
+  fresh random decoys with better than `1/k` accuracy —
+  `mesh/tests/retrieval_pattern_tests.rs::within_batch_real_address_is_not_identifiable_above_chance`,
+  measured across 2000 trials per `k` against the random-guess baseline, not
+  asserted from first principles alone.
+- **What decoy queries do NOT prove, found while building that
+  measurement, not assumed:** a still-pending (not yet claimed) message's
+  real address is deterministic and unchanged across repeated polls: decoys
+  are added *alongside* it each time, not used to transform or hide it, so
+  an adversary comparing two poll batches for a shared element recovers the
+  recurrence with the same (very high) accuracy whether decoys are present
+  or not.
+  `retrieval_pattern_tests.rs::cross_poll_recurrence_of_a_pending_address_is_not_hidden_by_decoys`
+  measures this directly and asserts the before/after accuracy are within
+  2% of each other — i.e., decoys measurably do nothing for this specific
+  attack. See design note §3a for the full account. **Practical
+  consequence:** an adversary who can observe queries across two otherwise
+  radio-layer-unlinkable encounters (exactly what Sub-Phase 4A's token
+  rotation exists to prevent) can re-link those two encounters at the
+  *application* layer whenever a message is slow enough to still be pending
+  on both polls — content and recipient identity remain protected, but the
+  *fact that the same interest recurred* does not. Not fixed this phase;
+  full PIR was considered and rejected as disproportionate machinery for a
+  single-hop intermittent mesh carrier model (design note §3).
+
 ---
 
 ## 4. Out of Scope (Current Phase)
@@ -128,6 +276,14 @@ This section states what Sphinx packet path-length, per-hop delay, and cover-tra
 - **Sealed-sender CA enrollment authentication:** see §3.5's trust-assumption paragraph.
 - **Acoustic / physical side-channel attacks**
 - **Denial-of-service resilience:** a mix node that receives a flood of malformed or excessive-volume packets has no rate limiting; a Sphinx-unwrap failure is rejected per-packet (fail closed) but nothing yet throttles an adversary who simply sends many packets.
+- **Raw radio-layer presence detection (Phase 4):** no software fix changes RF physics — see §3.7.
+- **Real CoreBluetooth (macOS/iOS), Android, and Windows mesh backends:** trait-ready (`parda_mesh::radio::MeshRadio`), not implemented this phase — see §3.7 and the README limitations table for the specific, cited restriction per platform.
+- **Real Wi-Fi Direct platform binding:** no viable Rust crate found for any target platform (checked, not assumed) — see §3.7.
+- **Full PIR/hidden-access-pattern retrieval:** considered (Talek, Cheng et al. ACSAC 2020) and rejected as disproportionate machinery for a single-hop intermittent mesh carrier model — see §3.7.2 and design note §3. Decoy queries are a narrower, measured mitigation, not a PIR-equivalent guarantee.
+- **Colluding-carrier retrieval-pattern correlation:** §3.7.2's measurement is against a single non-colluding logging carrier; a carrier that colludes with every other carrier a device ever polls through is a strictly stronger adversary not defeated by this phase's mitigation.
+- **Mesh flood/Sybil resistance against an attacker willing to reconnect indefinitely:** raised in cost, not eliminated — see §3.7.1. Building persistent-peer-identity infrastructure to rate-limit by identity was deliberately not done, since that infrastructure would itself be the tracking capability Sub-Phase 4A exists to avoid.
+- **Mobile (Flutter/Dart/Kotlin/Swift) mesh integration:** out of scope this phase, consistent with Phase 3's self-destruct mobile-UI deferral — no mesh-mode UI or native bridge exists yet.
+- **On-device power/battery measurement:** `mesh/tests/battery_cost_tests.rs` measures operation counts and wire-byte sizes at this crate's actual parameters, not real milliwatt draw — no BLE hardware exists in the environment this phase was built in to measure that. See README limitations.
 
 ---
 
@@ -163,6 +319,23 @@ Every ✅ row below is backed by a named test a reviewer can run; nothing is mar
 | REST API gateway (typed, versioned, provably never touches plaintext/keys) | ✅ Implemented & tested — Sub-Phase 3D | `gateway/tests/gateway_tests.rs` (3/3, incl. `test_ciphertext_passes_through_bit_identical`) |
 | `DirectTransport`/`MixTransport::receive` correctly parses the relay's actual response shape | ✅ Fixed & tested — found via the Sub-Phase 3D CLI's first real run | `protocol/src/transport.rs` (`FetchMessagesResponse`); latent since Phase 1, no prior test exercised `receive()` against a live relay |
 | Self-destructing message surviving an app restart while pending | 🔲 Not implemented — deliberately excluded from `parda-client-store`, no replacement holding area built yet | Not started |
+| No persistent radio-layer advertisement identifier | ✅ Implemented & tested — Sub-Phase 4A | `mesh/tests/passive_scanner_tests.rs` (all 3 tests, measured against random-guess baseline) |
+| Real BLE backend on at least one platform | ✅ Implemented — Sub-Phase 4A (Linux/`bluer` only; not compiled/run in this session — see §3.7) | `mesh/src/radio/bluez.rs`; compiled in CI's `mesh-adversarial` job, Linux leg, `--features bluez` |
+| DTN store-and-forward relay agent, RFC 9171 bundle framing | ✅ Implemented & tested — Sub-Phase 4B | `mesh/src/bundle.rs`, `mesh/tests/*` (bundle round-trip, opacity) |
+| Flood/Sybil resistance (bounded storage, session admission cap, TTL sweep) | ✅ Implemented & tested — Sub-Phase 4B | `mesh/tests/flood_resistance_tests.rs` (4/4) |
+| Malicious carrier cannot recover plaintext/sender/recipient from its own storage | ✅ Implemented & tested — Sub-Phase 4B | `mesh/tests/malicious_carrier_tests.rs` (3/3) |
+| Mesh partition/rejoin: no duplication, no silent loss | ✅ Implemented & tested — Sub-Phase 4B/4D | `mesh/tests/partition_rejoin_tests.rs` (3/3), `mesh/tests/multinode_simulation_tests.rs` (N=30 ring + churn) |
+| Blinded dead-drop addressing scheme (HKDF over a dedicated X25519 shared secret) | ✅ Implemented & tested — Sub-Phase 4C | `docs/phase4-4c-dead-drop-addressing-design.md`; `protocol/src/dead_drop.rs::tests` (6/6) |
+| Retrieval-pattern mitigation (decoy queries), within-batch claim | ✅ Implemented & tested — Sub-Phase 4C | `mesh/tests/retrieval_pattern_tests.rs::within_batch_real_address_is_not_identifiable_above_chance` |
+| Retrieval-pattern cross-poll recurrence — explicitly NOT mitigated by decoys | 🔲 Known, measured limitation — Sub-Phase 4C, see §3.7.2 | `mesh/tests/retrieval_pattern_tests.rs::cross_poll_recurrence_of_a_pending_address_is_not_hidden_by_decoys` |
+| Dead-drop address wired into `MessageEnvelope`, transport-agnostic (one envelope, any transport) | ✅ Implemented & tested — Sub-Phase 4C | `protocol/src/envelope.rs::dead_drop_address`; `mesh/tests/transport_tests.rs` (4/4) |
+| Self-destruct expiry correct under mesh latency, including expire-before-pickup | ✅ Implemented & tested — Sub-Phase 4C | `mesh/tests/expiry_tests.rs` (4/4) |
+| Hybrid online/mesh handoff, no message loss/duplication across the transition | ✅ Implemented & tested — Sub-Phase 4D | `mesh/tests/hybrid_handoff_tests.rs` (2/2) |
+| Combined field scenario: real `MixTransport` + `MeshTransport` under `HybridTransport`, mixed with mesh-only messages | ✅ Implemented & tested — Sub-Phase 4D | `mesh/tests/combined_field_scenario_tests.rs` (2/2) |
+| Battery/resource cost characterized (operation counts, wire bytes) | ✅ Measured — Sub-Phase 4D (operation counts only, no on-device power draw — see §3.7 and README) | `mesh/tests/battery_cost_tests.rs` (3/3) |
+| Real CoreBluetooth (macOS/iOS), Android, Windows mesh backends | 🔲 Not implemented — documented gap, not stub code — see §3.7 | Not attempted, no toolchain in this environment |
+| Real Wi-Fi Direct platform binding | 🔲 Not implemented — no viable Rust crate found for any platform | Not attempted |
+| Mobile (Flutter/Dart/Kotlin/Swift) mesh integration | 🔲 Out of scope this phase, same precedent as Phase 3's self-destruct mobile-UI deferral | Not attempted |
 | Post-quantum resistance | 🔲 Future (not in scope v0.x) | Not started |
 
 ---
@@ -176,6 +349,10 @@ Every ✅ row below is backed by a named test a reviewer can run; nothing is mar
 - Signal, "Technology preview: Sealed sender for Signal" (signal.org/blog/sealed-sender, 2018) — the design Sub-Phase 2A's `parda_protocol::sealed_sender` module implements, via `libsignal-protocol`'s own `sealed_sender_encrypt`/`sealed_sender_decrypt`
 - NIST SP 800-208 — Recommendation for Stateful Hash-Based Signature Schemes
 - CNSA 2.0 Suite — NSA Commercial National Security Algorithm Suite 2.0
+- RFC 9171, "Bundle Protocol Version 7" — the wire format `parda_mesh::bundle` implements via the `bp7` crate (`dtn7` org, Apache-2.0), not a custom bundle format. See `mesh/src/bundle.rs` module docs for why the `dtn7` daemon crate itself (same org) is not embedded.
+- Langley, "Pond" (2012; design overview archived at `imperialviolet.org`) — prior art for a keyed/counter-derived "dead drop" storage identifier, the lineage `parda_protocol::dead_drop`'s address derivation follows. See `docs/phase4-4c-dead-drop-addressing-design.md` §1-2.
+- Cheng et al., "Talek: Private Group Messaging with Hidden Access Patterns" (ACSAC 2020 / IACR ePrint 2020/066) — the formal "access sequence indistinguishability" property this phase's retrieval-pattern mitigation is scoped against and explicitly does not attempt to fully achieve (full PIR was considered and rejected as disproportionate — design note §3, §3a).
+- Piotrowska et al., "The Loopix Anonymity System" (USENIX Security 2017) — also the direct model for Sub-Phase 4C's decoy-query retrieval-pattern mitigation (`parda_protocol::dead_drop::build_poll_set`), reusing the same "indistinguishable dummy traffic" pattern already implemented and tested for Sub-Phase 2B's cover traffic (`mixnode/src/cover_traffic.rs`).
 
 ---
 

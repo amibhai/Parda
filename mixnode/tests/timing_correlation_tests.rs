@@ -83,6 +83,7 @@ fn make_envelope(flow_index: usize) -> MessageEnvelope {
         routing_hint: None,
         self_destruct_at: None,
         read_triggered_destruct: false,
+        dead_drop_address: None,
     }
 }
 

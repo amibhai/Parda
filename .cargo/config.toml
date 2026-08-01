@@ -1,0 +1,13 @@
+# Sub-Phase 4B build-environment gotcha, same category as the Perl/SQLCipher
+# one already documented in docs/phase1-architecture.md §11: `nanorand`
+# v0.7.0 (a transitive dependency of `bp7`, used for its Windows entropy
+# source) references `SystemFunction036` (the internal name for
+# `RtlGenRandom`) without the crate itself linking `advapi32.lib` for it on
+# the MSVC toolchain. Without this, `cargo test -p parda-mesh` fails at the
+# link step with `LNK2019: unresolved external symbol SystemFunction036`,
+# not at compile time — found by actually running the build on this
+# (Windows) dev machine, not assumed. This is a local/CI Windows-target
+# linker default, not a code fix; nothing in this workspace's own source
+# depends on `advapi32` directly.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-args=/DEFAULTLIB:advapi32.lib"]

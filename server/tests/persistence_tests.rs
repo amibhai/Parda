@@ -54,6 +54,7 @@ fn make_stored_envelope(id: &str, recipient: &str, marker: &str) -> StoredEnvelo
             routing_hint: None,
             self_destruct_at: None,
             read_triggered_destruct: false,
+            dead_drop_address: None,
         },
     }
 }

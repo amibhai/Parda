@@ -28,6 +28,7 @@ fn test_envelope_with_self_destruct_sets_advisory_deadline() {
         routing_hint: None,
         self_destruct_at: None,
         read_triggered_destruct: false,
+        dead_drop_address: None,
     }
     .with_self_destruct(Duration::from_secs(300));
 

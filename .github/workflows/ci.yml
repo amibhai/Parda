@@ -19,6 +19,11 @@ name: CI
 #     ubuntu-latest and windows-latest runners ship both out of the box
 #     — this is a local-dev-machine-only gotcha, see
 #     docs/phase1-architecture.md §11.
+#   - parda-mesh's `bluez` feature (Sub-Phase 4A's real BlueZ backend,
+#     Linux-only) needs libdbus-1-dev at compile time. Not enabled by
+#     default (see mesh/Cargo.toml) and not built by the plain
+#     `cargo build --workspace` below; only the mesh-adversarial job
+#     builds it, on ubuntu-latest only — see that job's own comment.
 
 on:
   push:
@@ -110,3 +115,49 @@ jobs:
 
       - name: Forensic-recovery capstone tests
         run: cargo test -p parda-protocol --test forensic_recovery_tests -- --test-threads=1 --nocapture
+
+  # Phase 4: the passive-scanner, malicious-carrier, flood-resistance,
+  # partition/rejoin, retrieval-pattern, and multi-node/hybrid-handoff
+  # adversarial tests (parda-mesh) — isolated into their own job for the
+  # same reason forensic-recovery is: these are the actual proof of this
+  # phase's claims (see docs/phase4-4c-dead-drop-addressing-design.md and
+  # docs/THREAT_MODEL.md §3.7), not incidental unit tests, and should not
+  # be implicitly deprioritized by living inside the general fast test
+  # job. Also covers `parda-mesh`'s `bluez` feature (Sub-Phase 4A's real
+  # BlueZ backend) on ubuntu-latest only — Linux-only by construction
+  # (bluer/BlueZ), and even there this only proves the backend compiles
+  # against the real bluer API; no GitHub-hosted runner has a Bluetooth
+  # radio, so advertise/scan/connect are never exercised against real RF
+  # here — see mesh/src/radio/bluez.rs module docs.
+  mesh-adversarial:
+    name: mesh adversarial/simulation tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protoc + clang + libdbus (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libdbus-1-dev
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test -p parda-mesh (simulated backend, all platforms)
+        run: cargo test -p parda-mesh --verbose -- --test-threads=1
+
+      - name: cargo check -p parda-mesh --features bluez (Linux only)
+        if: runner.os == 'Linux'
+        run: cargo check -p parda-mesh --features bluez --verbose

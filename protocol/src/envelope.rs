@@ -169,6 +169,27 @@ pub struct MessageEnvelope {
     /// advisory-only trust level. See `client_store` module docs.
     #[serde(default)]
     pub read_triggered_destruct: bool,
+
+    // ── Phase 4 (Sub-Phase 4C) ──────────────────────────────────────────
+
+    /// Blinded dead-drop storage address (`dead_drop::TagKey::address_for`),
+    /// set when a message is composed for delivery via `parda_mesh`'s
+    /// offline mesh transport. `None` for every other transport — one
+    /// envelope shape, any transport, per this phase's explicit
+    /// requirement; `DirectTransport`/`MixTransport` ignore this field
+    /// entirely. Additive and backward-compatible (`Option` +
+    /// `skip_serializing_if`), same pattern `self_destruct_at` and
+    /// `read_triggered_destruct` already established.
+    ///
+    /// **Composing a mesh-bound envelope also requires `sealed_sender =
+    /// true` with both `sender_id` and `recipient_id` empty** — unlike
+    /// `DirectTransport`, mesh routing uses this address instead of
+    /// `recipient_id`, so leaving either identity field populated would
+    /// hand it to every untrusted carrier that stores the bundle for no
+    /// routing benefit. `parda_mesh`'s `MeshTransport::send` enforces
+    /// this, fail-closed. See `docs/phase4-4c-dead-drop-addressing-design.md`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dead_drop_address: Option<[u8; 32]>,
 }
 
 impl MessageEnvelope {

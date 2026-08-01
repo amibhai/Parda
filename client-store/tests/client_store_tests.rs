@@ -18,6 +18,7 @@ fn plain_envelope(recipient: &str, timestamp_ms: u64) -> MessageEnvelope {
         routing_hint: None,
         self_destruct_at: None,
         read_triggered_destruct: false,
+        dead_drop_address: None,
     }
 }
 

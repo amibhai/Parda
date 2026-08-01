@@ -15,12 +15,13 @@
 //! | [`store`] | Storage trait + in-memory implementation (tests only) |
 //! | [`session`] | X3DH session init + Double Ratchet encrypt / decrypt; sealed-sender encrypt / decrypt |
 //! | [`sealed_sender`] | Sender-certificate authority (Sub-Phase 2A) |
-//! | [`envelope`] | Wire message type, version byte, Phase 3 extension stub |
+//! | [`envelope`] | Wire message type, version byte, self-destruct + dead-drop extension fields |
 //! | [`mixnet`] | Sphinx packet construction/processing (Sub-Phase 2B) |
-//! | [`transport`] | Transport abstraction — `DirectTransport`, `MixTransport` |
+//! | [`transport`] | Transport abstraction — `DirectTransport`, `MixTransport` (see `parda_mesh::transport::MeshNode` in the separate `mesh` crate for the third, Sub-Phase 4C, implementation) |
 //! | [`self_destruct`] | Time-bound and read-triggered self-destructing message primitive (Sub-Phases 3A/3B) |
 //! | [`clock_guard`] | Clock-rollback detection for self-destruct expiry (Sub-Phase 3A) |
 //! | [`secure_memory`] | Cross-platform `mlock`/`VirtualLock` to keep key material out of swap (Sub-Phase 3C) |
+//! | [`dead_drop`] | Anonymous, blinded dead-drop addressing for offline mesh delivery (Sub-Phase 4C) |
 //!
 //! ## Security Properties
 //!
@@ -35,19 +36,24 @@
 //!   [`mixnet`] and `mixnode::cover_traffic` (Sub-Phase 2B). Receive-path
 //!   (fetching from the relay) is not yet mix-anonymized — see
 //!   `transport` module docs.
-//! - **Time-bound cryptographic self-destruct (send-path independent):**
-//!   [`self_destruct::SelfDestructingMessage`] derives a fresh, local,
-//!   time-bound key (HKDF-SHA256) and provably zeroizes it at expiry —
-//!   see [`self_destruct`] and `docs/phase3-3a-self-destruct-design.md`
-//!   (Sub-Phase 3A). Read-triggered destruction (3B) and swap/cold-boot
-//!   hardening (3C) are not implemented yet.
+//! - **Time-bound and read-triggered cryptographic self-destruct
+//!   (send-path independent):** [`self_destruct::SelfDestructingMessage`]
+//!   derives a fresh, local key (HKDF-SHA256), locks its memory against
+//!   swap, and provably zeroizes it at expiry or first read — see
+//!   [`self_destruct`] and `docs/phase3-3a-self-destruct-design.md`
+//!   (Sub-Phases 3A-3C).
+//! - **Anonymous dead-drop addressing (offline mesh):**
+//!   [`dead_drop::TagKey`] derives blinded per-message storage addresses
+//!   from a dedicated, purpose-only shared secret — opaque to a mesh
+//!   carrier, unlinkable to recipient identity — see [`dead_drop`] and
+//!   `docs/phase4-4c-dead-drop-addressing-design.md` (Sub-Phase 4C).
 //!
 //! ## NOT provided yet (stubbed only)
 //!
-//! - Read-triggered self-destruct, swap/cold-boot hardening, session-burn (Sub-Phases 3B-3D)
 //! - Post-quantum key encapsulation (Phase 5)
 
 pub mod clock_guard;
+pub mod dead_drop;
 pub mod envelope;
 pub mod error;
 pub mod identity;

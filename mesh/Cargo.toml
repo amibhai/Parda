@@ -1,0 +1,64 @@
+[package]
+name        = "parda-mesh"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+description = "PARDA offline mesh dead-drop — BLE/Wi-Fi Direct proximity transport, DTN store-and-forward relay agent (Phase 4)"
+
+[dependencies]
+tokio       = { workspace = true, features = ["full"] }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+tracing     = { workspace = true }
+thiserror   = { workspace = true }
+async-trait = { workspace = true }
+rand        = "0.8"
+# Blinded dead-drop addresses are encoded as hex into bp7's EndpointID
+# (which only accepts URI-shaped demux strings, not raw bytes — see
+# mesh/src/bundle.rs module docs).
+hex         = "0.4"
+# Content-hashing stored bundle bytes for relay-agent dedup (relay.rs) —
+# not a protocol-crypto use, just an equality-avoidance optimization so
+# epidemic routing doesn't double-count a bundle relayed via two paths.
+sha2        = "0.10"
+# RFC 9171 (Bundle Protocol v7) CBOR encoding only — not the `dtn7` daemon
+# crate. See mesh/src/bundle.rs module docs and
+# docs/phase4-4c-dead-drop-addressing-design.md for why: `dtn7` is
+# architected as a standalone daemon reached over REST/WebSocket, not an
+# embeddable library, and is self-described as still under development.
+# Pulling its routing/networking internals in as a dependency for this
+# phase's most security-sensitive component would reopen the same
+# unaudited-assembly risk this project has already declined twice
+# (protocol/src/self_destruct.rs design note §1, §12). `bp7` is the
+# sibling crate (same `dtn7` org, Apache-2.0) that implements only the
+# wire format.
+bp7 = "0.10"
+# Shared MessageEnvelope, TransportLayer trait, and dead-drop addressing
+# (protocol/src/dead_drop.rs). A mesh relay agent never depends on
+# anything crypto-shaped beyond what it needs to treat as opaque bytes.
+parda-protocol = { path = "../protocol" }
+
+# Sub-Phase 4A: real BLE backend. `bluer` — official BlueZ bindings —
+# supports both GATT peripheral (advertiser/server) and central
+# (scanner/client) roles, which the cross-platform alternatives
+# (`bluest`, `btleplug`) do not (checked before committing to this
+# dependency; both are Central/Client-only). Linux-only: BlueZ is a Linux
+# D-Bus daemon. See mesh/src/radio/bluez.rs module docs and the
+# limitations doc for why CoreBluetooth/Android/Windows real backends are
+# not implemented this phase.
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { version = "0.17", features = ["bluetoothd", "l2cap"], optional = true }
+futures = { version = "0.3", optional = true }
+
+[features]
+# Real BlueZ backend, off by default (needs libdbus-1-dev at compile time
+# and bluetoothd at runtime — neither is assumed present). The simulated
+# radio (mesh::radio::simulated) is always available and is what every
+# adversarial/simulation test in this crate runs against.
+bluez = ["dep:bluer", "dep:futures"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+# Only used in tests/malicious_carrier_tests.rs, to check for the
+# envelope wire format's base64 text encoding of ciphertext bytes.
+base64 = { workspace = true }
