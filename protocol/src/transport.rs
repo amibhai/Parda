@@ -36,12 +36,36 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::Deserialize;
 
 use crate::{
     envelope::MessageEnvelope,
     error::{PardaError, Result},
     mixnet::{self, MixTopology},
 };
+
+/// Matches `parda-relay`'s actual `GET /v1/messages/{user_id}` response
+/// shape (`server/src/models.rs::FetchMessagesResponse` — `{"messages":
+/// [...]}`, not a bare array). Not re-exported: this is purely a
+/// deserialization target for `receive()`, kept in sync with the relay's
+/// wire shape by hand since `protocol` doesn't depend on `server`
+/// (that dependency would run the wrong direction — the relay depends on
+/// the protocol crate, not vice versa).
+///
+/// This mismatch was live in both `DirectTransport::receive` and
+/// `MixTransport::receive` — deserializing straight into `Vec<MessageEnvelope>`
+/// — from Phase 1 until Sub-Phase 3D's CLI prototype exercised `receive()`
+/// against a real relay for the first time and hit it immediately. No
+/// existing test called `receive()` against a live relay before that;
+/// `grep -r DirectTransport` across the whole repo, pre-fix, turned up
+/// zero test files. Recorded here, not just fixed silently, because it's
+/// exactly the kind of gap a real end-to-end harness catches and a
+/// mocked/unit-only one doesn't — the brief's stated reason for building
+/// the CLI early.
+#[derive(Deserialize)]
+struct FetchMessagesResponse {
+    messages: Vec<MessageEnvelope>,
+}
 
 // ─── Transport trait ──────────────────────────────────────────────────────────
 
@@ -98,7 +122,7 @@ impl TransportLayer for DirectTransport {
 
     async fn receive(&self, recipient_id: &str) -> Result<Vec<MessageEnvelope>> {
         let url = format!("{}/v1/messages/{}", self.relay_base_url, recipient_id);
-        let envelopes: Vec<MessageEnvelope> = self
+        let response: FetchMessagesResponse = self
             .http
             .get(&url)
             .send()
@@ -109,7 +133,7 @@ impl TransportLayer for DirectTransport {
             .json()
             .await
             .map_err(|e| PardaError::Transport(e.to_string()))?;
-        Ok(envelopes)
+        Ok(response.messages)
     }
 }
 
@@ -202,7 +226,7 @@ impl TransportLayer for MixTransport {
         // See module docs "MixTransport receive-path scope" — intentionally
         // identical to DirectTransport's fetch.
         let url = format!("{}/v1/messages/{}", self.relay_base_url, recipient_id);
-        let envelopes: Vec<MessageEnvelope> = self
+        let response: FetchMessagesResponse = self
             .http
             .get(&url)
             .send()
@@ -213,6 +237,6 @@ impl TransportLayer for MixTransport {
             .json()
             .await
             .map_err(|e| PardaError::Transport(e.to_string()))?;
-        Ok(envelopes)
+        Ok(response.messages)
     }
 }

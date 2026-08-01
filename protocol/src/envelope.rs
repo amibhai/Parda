@@ -143,6 +143,32 @@ pub struct MessageEnvelope {
     /// to derive its key from — not as a security boundary.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub self_destruct_at: Option<u64>,
+
+    // ── Phase 3 (Sub-Phase 3B) ──────────────────────────────────────────
+
+    /// `true` if this message should be destroyed after first read
+    /// rather than (or in addition to, if `self_destruct_at` is *also*
+    /// set) at a fixed deadline. `self_destruct_at` alone can't express
+    /// "destroy on read" — there's no fixed timestamp for a read-triggered
+    /// message — so this is a separate field, not an overload of that
+    /// one. `#[serde(default)]` so envelopes from before this field
+    /// existed deserialise as `false` (not self-destructing), matching
+    /// how `version` already handles this project's stated
+    /// wire-compatibility requirement.
+    ///
+    /// Same advisory-only caveat as `self_destruct_at`: this is what a
+    /// receiving UI uses to decide whether to call
+    /// `SelfDestructingMessage::seal` vs `seal_read_triggered`, not a
+    /// security boundary a hostile relay/mix node is prevented from
+    /// altering. It is, however, load-bearing for
+    /// `client_store::LocalMessageStore`'s write-path enforcement (Sub-Phase
+    /// 3D) — a message this device itself just decrypted and is about to
+    /// persist gets checked against its *own local* copy of this flag,
+    /// not one that traveled untrusted over the network, so the
+    /// persistence boundary itself does not inherit the wire's
+    /// advisory-only trust level. See `client_store` module docs.
+    #[serde(default)]
+    pub read_triggered_destruct: bool,
 }
 
 impl MessageEnvelope {
@@ -184,6 +210,15 @@ impl MessageEnvelope {
     #[must_use]
     pub fn with_self_destruct(mut self, expiry_window: std::time::Duration) -> Self {
         self.self_destruct_at = Some(self.timestamp_ms + expiry_window.as_millis() as u64);
+        self
+    }
+
+    /// Declare this envelope as read-triggered self-destructing — see
+    /// [`Self::read_triggered_destruct`] docs for what this does and
+    /// doesn't guarantee on the wire.
+    #[must_use]
+    pub fn with_read_triggered_destruct(mut self) -> Self {
+        self.read_triggered_destruct = true;
         self
     }
 }
