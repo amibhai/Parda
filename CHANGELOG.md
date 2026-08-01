@@ -9,6 +9,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Sub-Phase 3D (Application Layer: Session-Burn, Client Store, CLI, REST Gateway)
+
+Phase 3 (cryptographic self-destruct) is complete through this sub-phase.
+
+#### Protocol Layer (`/protocol`)
+- `store::InMemorySignalProtocolStore::burn_session` / `session::SessionManager::burn_conversation` (new): "burn this conversation" — removes session and trusted-identity state for a peer. Documented explicitly, everywhere the function appears, as a **materially weaker guarantee than message-level self-destruct**: `libsignal-protocol` v0.66.0's `PrivateKey` is a non-zeroizing `Copy` type (verified by reading the pinned tag's source), so byte-level erasure of session key material can't be proven the way `self_destruct::erase` proves it, without forking libsignal — the same no-custom-crypto tradeoff already declined once for the KDF (Sub-Phase 3A design note §1)
+- `envelope::MessageEnvelope::read_triggered_destruct: bool` (new, `#[serde(default)]`, additive): `self_destruct_at` alone can't express "destroy on read" (no fixed deadline) — needed so `parda-client-store`'s write path can correctly exclude *both* destruct modes, not just time-bound. `MessageEnvelope::with_read_triggered_destruct()` builder added to match `with_self_destruct()`
+- **Bug fix, found by actually running the new CLI**: `transport::{DirectTransport, MixTransport}::receive` deserialized the relay's `GET /v1/messages/{id}` response as a bare `Vec<MessageEnvelope>`; the relay has always returned `{"messages": [...]}`. Latent since Phase 1 — no existing test ever called `receive()` against a live relay. Fixed with a `FetchMessagesResponse` deserialization target matching the relay's actual shape
+
+#### New crate `/client-store` (`parda-client-store`)
+- `LocalMessageStore`: SQLCipher-backed client-side message history, mirroring `server/src/store.rs`'s proven encryption-at-rest pattern. `store_message` refuses — before any SQL runs, never a partial write — any envelope with `self_destruct_at` set or `read_triggered_destruct = true`. `history_for`, `delete_history_for` (for pairing with session-burn), `total_message_count`
+- 7 tests, all passing: ordinary round-trip, both destruct-mode refusals, no-partial-write-on-refusal, per-peer scoping (read and delete), ordering
+
+#### New crate `/gateway` (`parda-gateway`)
+- Typed, versioned (`/api/v1/...`) REST gateway in front of `parda-relay`, reached over real HTTP (no crate dependency on `parda-relay`, so no vendored-SQLCipher build requirement for this crate specifically). Message routes forward request bodies as raw, unparsed `Bytes` — the strongest version of "never touch ciphertext," no intermediate typed value exists to log or inspect even by accident
+- 3 tests: ciphertext passes through bit-identical, prekey bundle round-trips, unreachable relay surfaces as a clear 502 rather than a silent empty success
+
+#### New crate `/cli` (`parda-cli`)
+- `parda-cli demo [--expire-secs N | --read-once] [--relay-url URL]`: real X3DH handshake, real HTTP send/receive via `DirectTransport` against either a built-in stub relay or a real `parda-relay`, either self-destruct mode wrapped and demonstrated live (including the second-read/post-expiry failure), non-destructing messages persisted to the encrypted local store, then session-burn — actually run end-to-end for all three modes (plain, `--expire-secs`, `--read-once`) plus the mutually-exclusive-flags rejection, not just compiled
+
+#### Build environment
+- Resolved the `docs/phase1-architecture.md` §11 Perl gap for this session by installing a portable Strawberry Perl. `parda-client-store`, `parda-relay`, and `parda-mixnode`'s relay dev-dependency all compiled clean on the first try once unblocked — no logic bugs found in any of them by this fix; `parda-cli` needed two missing dependency lines added
+
+#### Documentation
+- `docs/phase3-3a-self-destruct-design.md` §12: session-burn's honest scope decision, the SQLCipher store's wire-format prerequisite, the gateway's architecture rationale, and the full Perl-gap/CLI-bug account
+- `docs/THREAT_MODEL.md`, `README.md`: Phase 3 marked complete through 3D, with new limitations for the session-burn guarantee gap, the still-unverified mobile Kotlin fix, and the still-missing restart-survival story for pending self-destructing messages
+
+### Added — Sub-Phase 3C (Cold-Boot / Swap / Forensic Recovery Hardening)
+
+#### Protocol Layer (`/protocol`)
+- `secure_memory` module (new): cross-platform `mlock`/`munlock` (Unix, `libc`) and `VirtualLock`/`VirtualUnlock` (Windows, `windows-sys`) — raw OS syscall FFI, not a crypto primitive. `locked_byte_count()` reads `/proc/self/status`'s `VmLck` on Linux so callers can verify a lock actually took effect via OS accounting, not just a non-error return code. Failure (e.g. `RLIMIT_MEMLOCK` in constrained containers) is logged and degrades swap-avoidance without breaking correctness
+- `self_destruct::DerivedKey` changed from an inline `[u8; 32]` to a dedicated `Box<[u8; 32]>` allocation, locked in `DerivedKey::new` (immediately after HKDF writes into it) and unlocked in `Drop` after zeroizing — its own page(s), not shared with unrelated `Arc`/`Mutex` bookkeeping
+- `Cargo.toml`: `libc` (unix-only target dependency), `windows-sys` with `Win32_System_Memory`/`Win32_Foundation` (windows-only target dependency)
+
+#### Tests (`/protocol/src/secure_memory.rs`, `/protocol/tests/forensic_recovery_tests.rs`)
+- `test_lock_increases_os_reported_locked_byte_count` / `test_locked_region_accounting_survives_memory_pressure` (Linux) — verify via `VmLck` accounting, including that the lock survives 256 MiB of genuine, touched memory pressure
+- `forensic_recovery_tests.rs` — the sub-phase's actual deliverable per the brief's own framing: seals a distinctively-tagged plaintext under both destruct modes, confirms it's absent from scanned process memory pre-read and present post-read (sanity check on the scan technique), triggers destruction, simulates seizure, and asserts the plaintext is unrecoverable. Linux-only sub-tests do a literal `/proc/self/mem` dump; portable sub-tests check the public API refuses. Documents explicitly that "dump all accessible storage" finds nothing because `SelfDestructingMessage` has no serialization or file I/O at all — by absence of capability, not a runtime check
+
+#### A real bug this sub-phase's own testing caught
+Manually `ptr::drop_in_place`-ing a `DerivedKey` in a test, after it started owning a real heap allocation (the new `Box`), caused a double-free against the compiler's own end-of-scope drop for the same variable — `STATUS_HEAP_CORRUPTION` on the first run after the change. Fixed by testing the `zeroize()` method directly through a still-live, still-owned reference instead of manually driving `Drop` — the same category of "test the safe way zeroize's own test suite does" fix as Sub-Phase 3A's, applied to a new case
+
+#### Mobile (`/mobile`)
+- `SignalPlugin.kt`: `handleEncryptMessage`/`handleDecryptMessage` now clear their `ByteArray` plaintext copy (`java.util.Arrays.fill(plaintext, 0)`) in a `finally` block after use — a Sub-Phase 3C audit finding (decrypted plaintext crossed the MethodChannel boundary in an unmanaged JVM array with no clearing). **Not runtime-verified against a real Flutter build** — no Android/Flutter toolchain was available; see design note §9 for the reasoning this relies on
+- No code changes to the Dart layer or iOS: audit findings only (Dart's `String`-based plaintext handling can't be provably erased regardless of native-layer discipline; no iOS native bridge exists to audit) — see design note §9
+
+#### Documentation
+- `docs/phase3-3a-self-destruct-design.md`: new §8 (swap-avoidance design + verification scope + forensic-recovery test), §9 (full mobile native-bridge audit write-up), updated §10/§11
+- `docs/THREAT_MODEL.md` §3.4, §5: updated with Sub-Phase 3C's delivered scope, remaining gaps (hibernation, plaintext-buffer locking, Windows verification asymmetry, mobile Dart `String` limitation), and test citations
+- `README.md`: Status table and seven new limitations documented (narrower-than-goal scope is the norm for this phase, not the exception)
+
+### Added — Sub-Phase 3B (Read-Triggered Destruction)
+
+#### Protocol Layer (`/protocol`)
+- `self_destruct` module: `SelfDestructingMessage::seal_read_triggered` — no expiry timer; the key is erased on the first successful `open()`, inside the same held `Mutex` lock as the decrypt, before returning to the caller, so there is no window (concurrent or sequential) in which a second reader can find the key still live. `open()` is now mode-aware: time-bound messages behave exactly as in Sub-Phase 3A, read-triggered messages additionally erase-in-place on success
+- Module docs restate the two modes' guarantees precisely per the brief's explicit requirement not to let them blur: time-bound = "gone by T regardless of read"; read-triggered = "gone after first read regardless of T," with no fallback timer
+
+#### Tests (`/protocol/tests/self_destruct_tests.rs`)
+- `test_time_bound_message_expires_even_if_never_read` / `test_read_triggered_message_has_no_timer_and_survives_until_read` — the two modes' guarantees, tested as the explicit symmetric pair the brief asked for
+- `test_read_triggered_second_open_fails_closed_after_first_succeeds` — sequential double-read fails closed
+- `test_read_triggered_concurrent_opens_only_one_succeeds` — the sub-phase's core deliverable: 32 tasks released simultaneously via a `tokio::sync::Barrier` race to open the same message; exactly one succeeds, deterministically (a mutex-structural guarantee, verified stable across repeated runs, not a timing-dependent one). Documented explicitly as the practical stand-in for "kill the process mid-render" for this in-memory-only primitive — see design note §5b for why a literal process-kill-and-restart test doesn't apply yet (nothing here persists across a real process exit; that's Sub-Phase 3D's job)
+
+#### Documentation
+- `docs/phase3-3a-self-destruct-design.md`: new §5b recording the atomicity design decision and the guarantee-separation table
+- `docs/THREAT_MODEL.md` §3.4, §5: updated from "Sub-Phase 3A ... Sub-Phases 3B-3D not started" to include 3B's delivered scope and test citations
+- `README.md`: Status table and two new limitations (read-triggered has no fallback timer by design; self-destructing messages don't yet survive an app restart while pending)
+
 ### Added — Sub-Phase 3A (Time-Bound Self-Destruct Key Derivation & Zeroize-on-Expiry)
 
 #### Design

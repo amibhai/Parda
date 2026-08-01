@@ -1,18 +1,24 @@
 name: CI
 
-# Runs the full workspace test suite (parda-protocol, parda-relay) on every
-# push and pull request against main. This was listed as planned for 0.1.0
-# and had not been wired up before Phase 2 — see CHANGELOG.md.
+# Runs the full workspace test suite on every push and pull request
+# against main, plus a dedicated job for the forensic-recovery /
+# memory-forensics tests (Sub-Phase 3C/3D — see that job's own comment
+# for why it's separate). This was listed as planned for 0.1.0 and had
+# not been wired up before Phase 2 — see CHANGELOG.md.
 #
-# Both crates pull in components that need native build tooling beyond a
-# bare Rust toolchain:
-#   - parda-protocol depends on libsignal-protocol (git dependency), which
-#     needs `protoc` to build its protobuf types.
-#   - parda-relay depends on rusqlite's `bundled-sqlcipher-vendored-openssl`
-#     feature (see server/src/store.rs), which compiles SQLCipher and
-#     OpenSSL from source and therefore needs a working Perl (OpenSSL's
-#     Configure step) and a C toolchain. GitHub-hosted ubuntu-latest and
-#     windows-latest runners ship both out of the box.
+# Some crates in this workspace need native build tooling beyond a bare
+# Rust toolchain:
+#   - parda-protocol (and everything that depends on it) needs
+#     libsignal-protocol's `protoc` for its protobuf types.
+#   - parda-relay, parda-client-store, and parda-cli (which depends on
+#     the client store) need `rusqlite`'s
+#     `bundled-sqlcipher-vendored-openssl` feature (see
+#     server/src/store.rs / client-store/src/lib.rs), which compiles
+#     SQLCipher and OpenSSL from source and therefore needs a working
+#     Perl (OpenSSL's Configure step) and a C toolchain. GitHub-hosted
+#     ubuntu-latest and windows-latest runners ship both out of the box
+#     — this is a local-dev-machine-only gotcha, see
+#     docs/phase1-architecture.md §11.
 
 on:
   push:
@@ -57,3 +63,50 @@ jobs:
 
       - name: cargo test --workspace
         run: cargo test --workspace --verbose
+
+  # Sub-Phase 3C/3D: the forensic-recovery and memory-forensics tests
+  # (protocol/src/self_destruct.rs's inline zeroize tests, its
+  # Linux-only /proc/self/mem scan, secure_memory.rs's mlock-accounting
+  # and memory-pressure tests, and protocol/tests/forensic_recovery_tests.rs)
+  # already run as part of `cargo test --workspace` above — this job
+  # exists in addition to that, not instead of it, per the explicit
+  # brief requirement not to let slower, more invasive memory-inspection
+  # tests be implicitly deprioritized by living inside the general test
+  # job. Scoped to parda-protocol only (that's where all of these live);
+  # --test-threads=1 because memory-forensics assertions are sensitive
+  # to what else is concurrently allocating in the same process.
+  forensic-recovery:
+    name: forensic-recovery tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install protoc + clang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Memory-forensics unit tests (self_destruct, secure_memory, clock_guard)
+        # A single positional filter is all `cargo test` accepts, so this
+        # is scoped by target (--lib) rather than a substring matching
+        # multiple module names — parda-protocol's lib test suite is
+        # small and entirely relevant here regardless.
+        run: cargo test -p parda-protocol --lib -- --test-threads=1 --nocapture
+
+      - name: Forensic-recovery capstone tests
+        run: cargo test -p parda-protocol --test forensic_recovery_tests -- --test-threads=1 --nocapture

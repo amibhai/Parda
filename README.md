@@ -115,7 +115,7 @@ Each phase produces independently testable deliverables. Phases 1–3 target sta
 
 > ⚠️ **RESEARCH PROTOTYPE — NOT FOR OPERATIONAL DEPLOYMENT**
 
-**Current phase: Phase 2 complete (Sub-Phase 2A + Sub-Phase 2B). Phase 3, Sub-Phase 3A (time-bound self-destruct key derivation + zeroize-on-expiry) implemented and tested — Sub-Phases 3B (read-triggered), 3C (swap/cold-boot hardening), and 3D (application layer) not yet started.**
+**Current phase: Phase 2 complete (Sub-Phase 2A + Sub-Phase 2B). Phase 3 complete through Sub-Phase 3D: 3A (time-bound self-destruct key derivation + zeroize-on-expiry), 3B (read-triggered destruction), 3C (swap avoidance + forensic-recovery capstone test + mobile audit), and 3D (session-burn, client-side encrypted history store, REST gateway, CLI prototype) all implemented and tested.**
 
 Every ✅ below is backed by a named test — see `docs/THREAT_MODEL.md` §5 for the exact test each row cites. A property is never marked done on the strength of the implementation alone.
 
@@ -136,8 +136,17 @@ Every ✅ below is backed by a named test — see `docs/THREAT_MODEL.md` §5 for
 | Time-bound self-destruct key derivation (HKDF, local secret — not the Double-Ratchet key, see limitations) | ✅ Sub-Phase 3A |
 | Self-destruct key provably erased from live process memory at expiry | ✅ Sub-Phase 3A |
 | Clock-rollback detection for expiry, fail-closed | ✅ Sub-Phase 3A |
-| Read-triggered self-destruct | 🔲 Sub-Phase 3B |
-| Self-destruct swap/cold-boot/forensic-recovery hardening | 🔲 Sub-Phase 3C |
+| Read-triggered self-destruct (no timer; erases on first read) | ✅ Sub-Phase 3B |
+| Read-triggered destruction is atomic — no double-read, even under a race | ✅ Sub-Phase 3B |
+| Derived key's memory locked against swap (`mlock`/`VirtualLock`) | ✅ Sub-Phase 3C |
+| Forensic-recovery capstone test (simulated seizure, both modes) | ✅ Sub-Phase 3C |
+| Mobile native-bridge audit | ✅ Sub-Phase 3C (findings below) |
+| Self-destruct swap/cold-boot hardening beyond the derived key (plaintext buffer, hibernation) | 🔲 Not yet implemented |
+| Session-level "burn this conversation" | ✅ Sub-Phase 3D (weaker guarantee than message self-destruct by necessity — see limitations) |
+| Client-side encrypted message history store (SQLCipher), structurally excludes self-destructing messages | ✅ Sub-Phase 3D |
+| CLI prototype — real X3DH, real HTTP transport, both self-destruct modes, session-burn | ✅ Sub-Phase 3D — actually run, not just compiled |
+| REST API gateway (typed, versioned, dumb pipe) | ✅ Sub-Phase 3D |
+| Self-destructing message surviving an app restart while pending | 🔲 Not yet implemented |
 | Offline mesh dead-drop | 🔲 Phase 4 |
 | Post-quantum key encapsulation (ML-KEM) | 🔲 Phase 5 |
 
@@ -161,6 +170,19 @@ The following limitations apply and must be understood before any evaluation:
 - **Self-destruct clock trust has known, unsolved gaps.** A monotonic timer plus a persisted rollback-detection watermark defeats an adversary who changes the device's wall clock through ordinary means. **It does not defend against a rooted/jailbroken device that can also rewrite the persisted watermark file, nor against a device that's powered off and never allowed to run the app process again** — no user-space mechanism can fire if the process never executes. See `docs/phase3-3a-self-destruct-design.md` §3.
 - **Self-destruct expiry is not yet proven against swap, hibernation, or cold-boot RAM extraction.** Sub-Phase 3A proves the key is gone from *live, resident* process memory (`protocol/src/self_destruct.rs` memory-forensics tests) — it says nothing about whether a copy was paged to disk before erasure ran. That's Sub-Phase 3C's job (`mlock`/swap-avoidance), not yet implemented.
 - **An adversary with a memory dump taken before expiry fires always recovers the plaintext.** No cryptographic self-destruct scheme changes this; it isn't a gap specific to PARDA's implementation, but it's stated here because it's easy to imply otherwise by omission.
+- **Read-triggered self-destruct has no timer at all — a message that is never read stays readable indefinitely.** This is the mode's documented contract (see `docs/phase3-3a-self-destruct-design.md` §5b), not an oversight; a caller wanting "expire by T or on read, whichever comes first" would need to combine both modes explicitly, which isn't implemented.
+- **Self-destructing messages don't yet survive an app restart while still pending.** `SelfDestructingMessage` (both modes) is in-memory only — there is no restart-surviving holding area distinct from the main SQLCipher message store yet. That boundary is Sub-Phase 3D's job.
+- **Only the derived key's memory is locked against swap — the decrypted plaintext buffer `open()` returns is not.** A caller holding that plaintext during a render window has a swap-exposure gap Sub-Phase 3C doesn't close. See `docs/phase3-3a-self-destruct-design.md` §8.
+- **`mlock`/`VirtualLock` don't defend against hibernation**, which can snapshot locked pages to disk by design — a documented, inherent limitation of this class of mitigation, not specific to PARDA.
+- **Memory-locking verification is asymmetric across platforms.** Linux locking is verified against the OS's own `/proc/self/status` accounting; Windows verification is limited to `VirtualLock`'s return code, since no equivalent low-friction per-process accounting API exists there.
+- **The mobile Kotlin plaintext-clearing fix (Sub-Phase 3C) has not been runtime-verified against a real Flutter build.** No Android/Flutter toolchain was available when it was made; the reasoning is standard, documented Flutter platform-channel behavior, but "reasoned correct" and "verified correct" are different claims. See `docs/phase3-3a-self-destruct-design.md` §9.
+- **The mobile app's Dart layer converts decrypted plaintext to a `String`**, which has no mutable backing storage in Dart — no zeroize discipline at any other layer can make this provably erasable as currently architected. This is a real constraint on Sub-Phase 3D's mobile self-destruct integration, not yet resolved.
+- **No iOS native bridge exists.** `mobile/ios/` has no `SignalPlugin.swift` or equivalent — a pre-existing gap, not introduced by Phase 3, but relevant since Sub-Phase 3C's mobile audit could only cover Android.
+- **"Burn this conversation" (session-level destruct) has a materially weaker guarantee than message-level self-destruct, and this is a hard limit, not a to-do.** `libsignal-protocol` v0.66.0's `PrivateKey` is a non-zeroizing `Copy` type (verified by reading `rust/core/src/curve.rs` in the pinned tag) — libsignal's own internals may hold implicit copies of session/identity key material that no code in this project can see or overwrite without forking libsignal, which would reopen the no-custom-crypto risk this project has declined twice now (§1 of the design note, and here). `burn_session` removes session/trust state from PARDA's own store — real and tested — but cannot claim byte-level erasure. See `docs/phase3-3a-self-destruct-design.md` §12.
+- **Self-destructing messages still don't survive an app restart while pending.** `parda-client-store`'s write path structurally refuses to persist any self-destructing envelope (by design — persistence and destructibility are meant to be mutually exclusive per message), but no replacement restart-surviving holding area exists yet. A message that arrives while the app is closed and isn't read before the app is later killed is simply gone with no record.
+- **The mobile Kotlin plaintext-clearing fix is still not runtime-verified against a real Flutter/Android build** — a different toolchain gap than the Rust workspace's vendored-SQLCipher/Perl requirement (`docs/phase1-architecture.md` §11 — now affects `parda-relay`, `parda-client-store`, and `parda-cli`), and not attempted this session.
+- **The CLI's prekey-bundle exchange is in-process, not over real HTTP** — a deliberate scope decision (see `cli/src/main.rs` module docs), matching existing precedent in `server/tests/`. What the CLI does exercise over genuine HTTP is message send/receive, which is the sub-phase's actual point.
+- **`parda-gateway` adds no auth, rate limiting, or request validation beyond what axum's `Json` extractor gives for free on the prekey-bundle routes.** It's an external-facing API surface where such things could grow, not a claim that they exist.
 
 This project is published for research, academic review, and engineering demonstration purposes only.
 
@@ -170,9 +192,12 @@ This project is published for research, academic review, and engineering demonst
 
 | Directory | Description |
 |-----------|-------------|
-| [`/protocol`](protocol/) | Rust: libsignal-protocol wrapper (X3DH, Double Ratchet, key gen), sealed sender, Sphinx mix-network packet build/unwrap (`mixnet`), transport abstraction, time-bound self-destruct (`self_destruct`, `clock_guard`) |
+| [`/protocol`](protocol/) | Rust: libsignal-protocol wrapper (X3DH, Double Ratchet, key gen), sealed sender, Sphinx mix-network packet build/unwrap (`mixnet`), transport abstraction, time-bound + read-triggered self-destruct (`self_destruct`, `clock_guard`, `secure_memory`), session-burn |
 | [`/server`](server/) | Rust/Axum: dumb-pipe relay server (store-and-forward), SQLCipher persistence, sealed-sender certificate authority |
 | [`/mixnode`](mixnode/) | Rust/Axum: mix-network node daemon — Sphinx forwarding, per-hop mixing delay, drop-cover traffic (Sub-Phase 2B) |
+| [`/gateway`](gateway/) | Rust/Axum: typed, versioned REST API gateway in front of `parda-relay` (Sub-Phase 3D) |
+| [`/client-store`](client-store/) | Rust: client-side encrypted local message store (SQLCipher), structurally excludes self-destructing messages (Sub-Phase 3D) |
+| [`/cli`](cli/) | Rust: CLI prototype exercising the full send/receive/self-destruct/burn flow end-to-end (Sub-Phase 3D) |
 | [`/mobile`](mobile/) | Flutter: cross-platform client with Android Keystore integration |
 | [`/docs`](docs/) | Architecture decisions, threat model |
 
