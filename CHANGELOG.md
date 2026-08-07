@@ -9,6 +9,132 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added / Fixed — Android Client Made Usable (verified on a Pixel 8)
+
+The Android app previously could not work at all: it built and launched,
+but no message could ever be sent *or* received, and any restart left it
+convinced it was enrolled while holding no keys. This entry covers making
+it genuinely usable and, more importantly, what running it on real
+hardware found that compiling never could.
+
+#### Blocking defects fixed — each one made the app non-functional
+
+- **No inbound message could ever arrive.** `session_service.dart` read
+  `envelopeJson['envelope']['sender_id']`, but the relay serialises
+  `StoredEnvelope` with `#[serde(flatten)]`, so the fields arrive at the
+  top level and there is no nested `envelope` object. Every poll threw,
+  the throw was swallowed by the surrounding catch, and messages silently
+  vanished. Now parses either shape.
+- **No outbound message could ever be decrypted.** `SignalPlugin.kt` set
+  `sender_id` to the literal string `"local"`, so the recipient looked up
+  a session under the address `local` instead of the real sender. Now
+  sends the enrolled user ID; envelopes also declare `version: 2`
+  explicitly rather than relying on the relay's serde default.
+- **Identity did not survive a restart.** The store was
+  `InMemorySignalProtocolStore`, while the Dart layer persisted a user ID
+  and treated its presence as "enrolled" — so after any restart every
+  send failed `NOT_ENROLLED` with no recovery short of clearing app data.
+  New `PersistentSignalStore` decorates libsignal's own in-memory store
+  and mirrors every mutation to `EncryptedSharedPreferences` (master key
+  in the Android Keystore). It never parses key material itself; every
+  value is a blob from libsignal's own `serialize()`.
+- **`getPreKeyBundle` returned a placeholder** (`{"registered": true}`),
+  which the relay would store and serve to peers as a bundle with no
+  usable key material — so a second device could never establish a
+  session. Now built from live key material, handing out the
+  lowest-numbered unused one-time prekey.
+- **The relay URL was a compile-time constant**, making the app unusable
+  on a real device without rebuilding it. Now runtime-settable and
+  persisted, with one-tap presets for `adb reverse` and the emulator, a
+  reachability check, and bounded request timeouts (the default `http`
+  client waits forever, so a wrong address looked like a hang).
+
+#### Found only by running it on hardware
+
+- **Flutter's platform channel returns an *unmodifiable* `Uint8List`.**
+  `PlaintextHandle.renderCopy` zeroed that buffer unconditionally, which
+  threw `UnsupportedError` and meant **no received message ever
+  rendered** — each showed a permanent "…". Zeroing is now best-effort.
+  The security consequence is real and unsolved, and is documented as an
+  addition to (not a replacement for) the existing Dart `String`
+  residual: that buffer cannot be scrubbed by app code and persists until
+  GC. Copying it into a modifiable list first would be worse — two
+  copies, the original still unscrubable.
+- **Mesh mode could never have started.** `JNIEnv::find_class` resolves
+  against the calling thread's class loader; a thread attached from
+  native code gets the *system* loader and cannot see application
+  classes, so every Rust→Kotlin call raised `ClassNotFoundException`. The
+  `MeshBridge` class is now resolved once in `JNI_OnLoad` (which runs on
+  a thread that does have the app loader) and held as a global reference.
+  `ffi.rs` deliberately does not fall back to `find_class`.
+- **`MeshNode` never advertised.** Its loops scan and accept, but nothing
+  in the node ever called `MeshRadio::advertise` — every test that looked
+  like it exercised discovery seeded a token directly into `SimNetwork`
+  instead. On hardware the device scanned while staying permanently
+  invisible to peers. `lifecycle.rs` now advertises immediately on start
+  (the existing rotation loop sleeps a full 120s interval before its
+  first rotation) and spawns the rotation loop.
+- **The advertisement never fit.** A 128-bit service UUID plus a 16-byte
+  rotating token is 57 bytes into a 31-byte legacy advertisement —
+  `ADVERTISE_FAILED_DATA_TOO_LARGE`, every time. Now uses LE extended
+  advertising. Where the controller does not support it, mesh mode fails
+  loudly rather than falling back to advertising a bare static service
+  UUID, which would be precisely the persistent radio-layer identifier
+  Sub-Phase 4A exists to prohibit.
+- **Rust logs went nowhere on Android.** `tracing_subscriber::fmt` writes
+  to stdout, which the platform discards — which is why both bugs above
+  stayed silent. Now routed to logcat under the `parda` tag
+  (`adb logcat -s parda`).
+
+#### New
+
+- **`parda-cli peer`** — a real conversation partner for a separate
+  client. Enrolls an identity, publishes a prekey bundle over HTTP, polls
+  and decrypts, optionally echoes replies. The `demo` subcommand runs
+  both sides in one process and so could never serve as the far end for
+  the app; this is what made a genuine two-party test possible at all.
+  It is also the first thing in the workspace to exercise the
+  bundle-publish path against a non-Rust client.
+- **Android UI**: centralised design tokens (`theme/app_theme.dart`),
+  onboarding with relay configuration, conversation list with live relay
+  and mesh status, chat, new-chat sheet, settings (relay, mesh toggle,
+  re-publish keys, erase identity), and a **safety-number screen** —
+  which makes Sub-Phase 4.5D's fingerprint reachable by a human for the
+  first time. The screen states plainly that comparison there is
+  advisory: this client stores no verified state, so it will not warn on
+  a later key change.
+- **Runtime BLE permission flow** (`MeshPlugin` is now `ActivityAware`).
+  The permissions were declared in Sub-Phase 4.5B but never requested, so
+  every BLE call would have failed with a `SecurityException` on a real
+  device.
+
+#### Verified on hardware, and what still is not
+
+Exercised on a Pixel 8 (Android 17) against a live `parda-relay`:
+enrollment; X3DH over real HTTP; a full send/receive round trip with
+`parda-cli peer` (message out, echo back, both rendered); identity and
+session survival across a force-stop; safety-number display;
+re-publishing keys; the Bluetooth permission grant; and mesh advertising
+confirmed via `dumpsys bluetooth_manager` (`com.parda.app` active,
+`Legacy: false`, `Connectable: true`, no device name, service data
+carrying the token).
+
+**Still unverified:** two devices discovering each other and completing a
+bundle exchange — this project has never had two devices running it
+simultaneously — and the passive-scanner correlation test has never been
+run against the Android backend on real radio.
+
+#### Cross-implementation contract
+
+`protocol/src/trust.rs` gains
+`fingerprint_matches_the_android_implementation_known_answer`: the Kotlin
+safety-number implementation cannot call into the Rust crate (the Android
+client uses libsignal-android), so the two constructions must agree
+byte-for-byte or two honest devices would show their users different
+numbers. The vector is a real capture — two identity keys published to a
+live relay, and the digits the Android UI actually displayed. Rust and
+Kotlin matched exactly; the test pins it.
+
 ### Added — Sub-Phases 4.5B-4.5E (Mobile Native Bridges, Trust Bootstrapping, Operational Hardening)
 
 Completes Phase 4.5. Unlike Phases 3 and 4, this phase resolved more than it opened — but three of its five sub-phases still ship narrower than their goal, and each boundary is stated rather than rounded up. Two new workspace crates: `/mobile-bridge` and `/tls`.

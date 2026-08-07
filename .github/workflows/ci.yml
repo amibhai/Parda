@@ -297,3 +297,38 @@ jobs:
       - name: Mix-node identity persistence tests
         # Quoted for the same reason as the trust:: filter above.
         run: "cargo test -p parda-mixnode --lib identity:: --verbose"
+
+  # The Android client. Added after making it usable on real hardware —
+  # until then nothing in CI touched `mobile/` at all, so a Dart
+  # compile error or a broken startup path could land unnoticed. The
+  # Kotlin/Gradle build is deliberately *not* run here: it needs the
+  # Android SDK plus a `cargo-ndk` cross-compile of parda-mobile-bridge,
+  # which is a materially heavier job than this one, and its failure
+  # modes are caught locally by anyone actually building the app.
+  mobile-client:
+    name: flutter analyze + test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Resolve dependencies
+        working-directory: mobile
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: mobile
+        run: flutter analyze
+
+      # Covers the startup routing both ways — that an enrolled user is
+      # never re-prompted (which would overwrite a working identity) and
+      # that a fresh install reaches onboarding.
+      - name: Widget tests
+        working-directory: mobile
+        run: flutter test
