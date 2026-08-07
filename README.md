@@ -197,6 +197,7 @@ The following limitations apply and must be understood before any evaluation:
 - **`mlock`/`VirtualLock` don't defend against hibernation**, which can snapshot locked pages to disk by design — a documented, inherent limitation of this class of mitigation, not specific to PARDA.
 - **Memory-locking verification is asymmetric across platforms.** Linux locking is verified against the OS's own `/proc/self/status` accounting; Windows verification is limited to `VirtualLock`'s return code, since no equivalent low-friction per-process accounting API exists there.
 - **The mobile Kotlin plaintext-clearing fix (Sub-Phase 3C) now compiles against the real Android SDK, but its runtime path has still never been executed.** Sub-Phase 4.5B scaffolded the Android project and built a real debug APK, which surfaced two genuine pre-existing defects in `SignalPlugin.kt` that no amount of reading had caught: `KeyHelper.generatePreKeys(start, count)` does not exist in any current libsignal-android release (confirmed against the source at the pinned tag), and `CiphertextMessage` was never imported. Both are fixed. "Compiles against the real SDK" and "the zeroize path was observed running" remain different claims, and only the first is made here.
+- **Flutter's platform channel hands back an *unmodifiable* `Uint8List`, so the Dart-side copy of a decrypted message cannot be scrubbed by app code.** Found on the Pixel 8: the code zeroed that buffer unconditionally, which threw `UnsupportedError` inside `renderCopy` and meant *no received message ever rendered* — it showed a permanent "…" instead. Zeroing is now best-effort. The security consequence is real and unsolved: that buffer persists until Dart's GC reclaims it, which is an addition to the `String` residual below rather than a replacement for it. Copying into a modifiable list first would make it worse — two copies, the original still unscrubable.
 - **The Dart plaintext gap is narrowed, not closed.** Sub-Phase 4.5C moves decrypted content into a native zeroize-on-release buffer (`parda_protocol::plaintext_ffi::PlaintextHandle`, reusing `self_destruct`/`secure_memory`'s already-audited discipline) reached through JNI, so `decryptMessage` now returns an opaque handle instead of raw bytes and `SessionService` never caches a decrypted `String`. **Flutter's `Text` widget still takes a Dart `String`** — there is no public Flutter API to render from a native buffer — so a transient `String` still materializes per render and lives as long as whatever holds it. The window goes from "the whole app session" to "one render pass, until the app is backgrounded"; a memory dump taken inside that window still finds the plaintext. See `docs/phase4.5c-dart-plaintext-design.md` §1 and §4.
 - **The iOS bridge exists but has never been compiled or run — categorically, not "not yet."** `mobile/ios/Runner/SignalPlugin.swift` and `CoreBluetoothMeshRadio.swift` are written against Signal's real `LibSignalClient` Swift package and the real CoreBluetooth API, and are labeled as unverified in their own headers. No macOS or Xcode exists in this environment and no path to one does. Treat this code as a reviewed design sketch, not as working software. Writing it did surface two real CoreBluetooth findings recorded there: a backgrounded iOS peripheral's advertisement is stripped by the OS to the service-UUID overflow area only, and `CBPeripheralManager.startAdvertising` does not support service-data payloads *at all* — foreground or background — so the `AdvertToken` payload would have to move to a GATT characteristic read on iOS specifically.
 - **Out-of-band identity verification does not protect first contact, and no verification UI exists.** Sub-Phase 4.5D detects an identity-key substitution *after* a peer has been marked `Verified` (`PardaError::IdentityKeyChangedAfterVerification`, tested on both the prekey-bundle and sealed-sender paths). A MITM present at first contact still succeeds — TOFU pins whatever key arrived first, exactly as before and exactly as in any TOFU scheme including Signal's — and `trust_bootstrapping_tests.rs` asserts that weakness deliberately so the documentation stays honest under test. The fingerprint construction is HKDF-SHA256 over both sorted identity keys, displayed as 60 digits: **inspired by Signal's safety numbers, explicitly not bit-compatible with them**, since re-deriving Signal's exact iterated-SHA-512 algorithm from memory risked getting a security-relevant detail subtly wrong. `TrustStore::record_verified` is the seam a future UI would call; this phase ships no such UI, so verification is currently only reachable from code. See `docs/phase4.5d-trust-bootstrapping-design.md`.
@@ -205,7 +206,7 @@ The following limitations apply and must be understood before any evaluation:
 - **The CLI's prekey-bundle exchange is in-process, not over real HTTP** — a deliberate scope decision (see `cli/src/main.rs` module docs), matching existing precedent in `server/tests/`. What the CLI does exercise over genuine HTTP is message send/receive, which is the sub-phase's actual point.
 - **`parda-gateway` now has API-key auth and rate limiting, both opt-in and therefore off by default.** Bearer keys are checked in constant time (`subtle::ConstantTimeEq` — a byte-by-byte early-exit comparison against a secret leaks its prefix through timing) against `PARDA_GATEWAY_API_KEYS`; with none configured, every request is accepted, exactly as before Sub-Phase 4.5E, and startup logs a warning saying so. **An API key authenticates the API client, not a human** — PARDA has no accounts, and adding real user authentication at the gateway would create precisely the metadata concentration point the rest of the project avoids. The token-bucket limiter is per-process and in-memory: restarting resets every bucket and two instances behind a load balancer do not share state, so it bounds casual abuse, not a distributed attacker. `/health` is deliberately outside the auth layer. See `gateway/src/auth.rs`.
 - **Raw radio-layer presence detection is unavoidable and not defended.** Rotation defeats re-identifying the same device across two encounters; it cannot and does not defeat detecting that a device is present during one. No software fix changes RF physics. See `docs/THREAT_MODEL.md` §3.7.
-- **Real mesh backends now exist for two platforms — Linux (`bluer`/BlueZ) and Android — but neither has ever moved a byte over real Bluetooth in this project's pipeline.** Sub-Phase 4.5B added `parda-mobile-bridge` (a purpose-built Rust↔JNI bridge; the brief's premise that `SignalPlugin.kt` already established one was incorrect — it is pure Kotlin/JVM libsignal and never touches Rust) plus `MeshBridge.kt`'s real `BluetoothLeAdvertiser`/`BluetoothLeScanner`/`BluetoothGattServer` implementation. What was genuinely verified: the crate cross-compiles for `x86_64-linux-android` and `aarch64-linux-android` via `cargo-ndk`, links into a real debug APK, and that APK installs and launches on a real emulator with the native library loading successfully and no crashes. **What was not done, and is not claimed:** the Dart UI never calls `startMesh()`, and the passive-scanner correlation test (`mesh/tests/passive_scanner_tests.rs`) was never run against the Android backend on emulated (rootcanal) or real radio hardware. Windows remains unimplemented; iOS is the never-compiled sketch described above.
+- **The Android mesh backend now genuinely advertises over real Bluetooth LE, verified on a Pixel 8 — but a two-device exchange has still never been observed.** Running it on hardware found three bugs that compiling could not: (1) `JNIEnv::find_class` resolves against the *calling thread's* class loader, and a natively-attached tokio thread gets the system loader, so every Rust→Kotlin call raised `ClassNotFoundException` — mesh mode could never have started, and the class is now cached in `JNI_OnLoad`; (2) `MeshNode` never called `advertise()` at all (its loops only scan and accept — every test seeded a token directly into `SimNetwork`), so the device scanned while remaining permanently invisible; (3) a 128-bit service UUID plus a 16-byte rotating token is 57 bytes into a 31-byte legacy advertisement, so it failed with `ADVERTISE_FAILED_DATA_TOO_LARGE` every time and now uses LE extended advertising. **Verified:** `dumpsys bluetooth_manager` shows `com.parda.app` as an active advertiser, `Legacy: false`, `Connectable: true`, no device name, service data carrying the token. **Still not verified, and not claimed:** two devices actually discovering each other and completing a bundle exchange — this project has never had two devices running it at once — and the passive-scanner correlation test has never been run against the Android backend on real radio. Where LE extended advertising is unsupported, mesh mode now fails loudly rather than falling back to advertising a bare static UUID, which would be exactly the persistent radio-layer identifier Sub-Phase 4A prohibits. Windows remains unimplemented; iOS is the never-compiled sketch described above.
 - **The `bluer` real backend has not been compiled in this session.** It's gated `#[cfg(target_os = "linux")]` behind the `bluez` feature; the development machine is Windows, so local `cargo check` never touches it. Its first real compile happens in CI's `mesh-adversarial` job (Linux leg). Even once compiled, no GitHub-hosted CI runner has a Bluetooth radio, so `advertise`/`scan`/`connect`/`accept` are never exercised against real RF anywhere in this project's current pipeline.
 - **App-level "MAC rotation" only ever means the advertised payload.** iOS hides the link-layer address from apps entirely (a random per-app `CBPeripheral` UUID instead of a MAC) and rotates it at the OS level on its own ~15-minute schedule with zero app control. Android's address randomization is OS/manufacturer policy, also with no fine-grained app control (observed absent entirely on some Samsung devices in prior published research). Linux/BlueZ's resolvable-private-address rotation is a kernel/`bluetoothd` privacy-subsystem setting. What `parda_mesh::radio::AdvertToken` rotation actually controls, on every platform, is the advertised payload only.
 - **No real Wi-Fi Direct platform binding exists for any target platform.** No viable Rust crate was found (checked, not assumed) — the large-bundle-transfer path is proven at the protocol/relay level only, via `SimulatedMeshRadio`'s `SimProfile::WifiDirect` throughput profile.
@@ -247,33 +248,92 @@ See [`docs/phase1-architecture.md`](docs/phase1-architecture.md) for stack decis
 
 ## Setup & Installation
 
-> 🚧 **Installation instructions will be added when Phase 1 is complete.**
-
-### Prerequisites (planned)
+### Prerequisites
 
 ```bash
 # Rust toolchain
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 rustup update stable
 
-# Flutter SDK (for mobile client)
+# Flutter SDK (for the Android client)
 # See: https://flutter.dev/docs/get-started/install
-
-# Docker (for mix node development environment)
-docker --version  # >= 24.x recommended
 ```
 
-### Build (placeholder)
+Two build prerequisites are easy to trip over and are documented rather
+than left to be discovered:
+
+- **`parda-relay`, `parda-client-store`, and `parda-cli` need a complete
+  Perl** for the vendored SQLCipher/OpenSSL build (`docs/phase1-architecture.md`
+  §11). Git-for-Windows' minimal Perl is not enough; Strawberry Perl works.
+- **The Android client needs `cargo-ndk`** and the Android Rust targets:
+  ```bash
+  cargo install cargo-ndk
+  rustup target add aarch64-linux-android x86_64-linux-android
+  ```
+
+### Build and test the Rust workspace
 
 ```bash
-git clone https://github.com/your-org/parda.git
-cd parda
-cargo build --release       # Core cryptographic layer
-# docker compose up         # Mix node cluster (Phase 2)
-# flutter build apk         # Android client (Phase 3)
+cargo build --workspace
+cargo test  --workspace          # 170 tests
 ```
 
-*Full setup documentation will be maintained in [`docs/SETUP.md`](docs/SETUP.md) as each phase ships.*
+### Run the Android client end-to-end
+
+This is the path that has actually been exercised on hardware (a Pixel 8,
+Android 17) — see Status & Limitations for exactly what that did and did
+not prove.
+
+**1. Start a relay.**
+
+```bash
+PARDA_DB_KEY=$(openssl rand -hex 32) \
+PARDA_DB_PATH=./parda-relay.sqlite3 \
+PARDA_BIND=127.0.0.1:8080 \
+cargo run -p parda-relay
+```
+
+**2. Make it reachable from the phone.** `adb reverse` maps the device's
+own loopback to the host's, so the app's default relay URL works
+unchanged over USB:
+
+```bash
+adb reverse tcp:8080 tcp:8080
+```
+
+On an emulator instead of a physical device, skip this and pick the
+"Android emulator" preset in the app's Settings (`10.0.2.2`).
+
+**3. Build and install the app.**
+
+```bash
+cargo ndk -t arm64-v8a -o mobile/android/app/src/main/jniLibs \
+  build -p parda-mobile-bridge
+cd mobile && flutter build apk --debug && flutter install
+```
+
+**4. Enroll.** Open the app, pick a user ID, confirm the relay address,
+and tap *Generate keys & enroll*. The home screen's status bar should
+read **Relay online**.
+
+**5. Give yourself someone to talk to.** Messaging needs a second party.
+`parda-cli peer` is a real one — it generates a Signal identity,
+publishes a prekey bundle over HTTP, and decrypts what it receives:
+
+```bash
+cargo run -p parda-cli -- peer \
+  --relay-url http://127.0.0.1:8080 --user-id bob --echo
+```
+
+Then tap **New chat** in the app, enter `bob`, and send a message. With
+`--echo` the peer replies, so both directions are exercised. The peer's
+identity is regenerated on every run and is not persisted — restarting it
+invalidates the app's existing session with it.
+
+**Optional — mesh mode.** Settings → *Mesh mode* requests the Bluetooth
+permissions and starts advertising. `adb logcat -s parda` shows the Rust
+side's own log output, and `adb shell dumpsys bluetooth_manager` will
+list `com.parda.app` as an active advertiser once it is running.
 
 ---
 
