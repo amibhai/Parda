@@ -10,8 +10,6 @@ use jni::{
 
 use crate::jvm;
 
-const MESH_BRIDGE_CLASS: &str = "com/parda/app/MeshBridge";
-
 /// Attach the calling thread to the JVM (tokio worker threads aren't
 /// attached by default — see crate root docs) and run `f` with the
 /// resulting `JNIEnv`. The guard detaches automatically on drop.
@@ -20,8 +18,22 @@ pub fn with_env<R>(f: impl FnOnce(&mut JNIEnv) -> jni::errors::Result<R>) -> jni
     f(&mut guard)
 }
 
-fn mesh_bridge_class<'a>(env: &mut JNIEnv<'a>) -> jni::errors::Result<JClass<'a>> {
-    env.find_class(MESH_BRIDGE_CLASS)
+/// The `MeshBridge` class, from the global reference cached in
+/// `JNI_OnLoad`.
+///
+/// **Deliberately not `env.find_class(...)`.** On a thread attached
+/// from native code — which is every thread this function runs on —
+/// `find_class` searches the *system* class loader and cannot see
+/// application classes, so it raised `ClassNotFoundException` on every
+/// call. See `JNI_OnLoad`'s comment for how that was found. Falling
+/// back to `find_class` here would silently reintroduce the bug on any
+/// path where the cache was not populated, so this returns an error
+/// instead.
+fn mesh_bridge_class<'a>(_env: &mut JNIEnv<'a>) -> jni::errors::Result<&'static JClass<'static>> {
+    match crate::mesh_bridge_class() {
+        Some(global) => Ok(<&JClass>::from(global.as_obj())),
+        None => Err(jni::errors::Error::JavaException),
+    }
 }
 
 fn to_jbytes<'a>(env: &mut JNIEnv<'a>, bytes: &[u8]) -> jni::errors::Result<JObject<'a>> {
