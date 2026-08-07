@@ -57,7 +57,7 @@ object MeshBridge {
     private lateinit var appContext: Context
     private lateinit var bluetoothManager: BluetoothManager
 
-    private var currentAdvertiseCallback: AdvertiseCallback? = null
+    private var currentAdvertiseCallback: AdvertisingSetCallback? = null
     private val scanCallbacks = ConcurrentHashMap<Long, ScanCallback>()
     private var gattServer: BluetoothGattServer? = null
     private val pendingAcceptRequestIds = java.util.concurrent.ConcurrentLinkedQueue<Long>()
@@ -105,38 +105,86 @@ object MeshBridge {
         }
         ensureGattServer()
 
-        // Rotation: a fresh call always fully replaces whatever was
-        // previously advertised — see radio module docs on why the
-        // *payload* rotating, not any link-layer address this app has
-        // no control over regardless, is what this backend can actually
-        // guarantee.
-        currentAdvertiseCallback?.let { advertiser.stopAdvertising(it) }
+        // ── Why LE *extended* advertising, not the legacy API ──────────
+        //
+        // The first version used `startAdvertising` (legacy, 31-byte
+        // payload) with both a service-UUID entry and service data.
+        // On a real Pixel 8 that failed every time with
+        // ADVERTISE_FAILED_DATA_TOO_LARGE (code 1), and the arithmetic
+        // says it always would have:
+        //
+        //   flags                            3
+        //   128-bit service UUID        2 + 16 = 18
+        //   service data (UUID + token) 2 + 16 + 18 = 36
+        //                                   ── 57 bytes into 31
+        //
+        // Even service data alone is 41 bytes. A 128-bit UUID plus a
+        // 16-byte rotating token simply does not fit a legacy
+        // advertisement — the maximum token that would fit is 10 bytes,
+        // and shrinking it would weaken the unlinkability margin
+        // `mesh/tests/passive_scanner_tests.rs` measures at 128 bits.
+        //
+        // Extended advertising (API 26+, ~1650 bytes on this device)
+        // carries it comfortably. Where the controller does not support
+        // it, this fails loudly rather than falling back to advertising
+        // the service UUID alone: a bare, unchanging UUID with no
+        // rotating payload is exactly the "persistent radio-layer
+        // identifier" Sub-Phase 4A exists to prohibit, so silently
+        // degrading to it would trade the property this feature is for
+        // against the appearance of working.
+        if (!adapter.isLeExtendedAdvertisingSupported) {
+            nativeOnAdvertiseResult(
+                requestId,
+                false,
+                "this device's Bluetooth controller does not support LE extended advertising, " +
+                    "which PARDA mesh mode requires to fit its rotating token"
+            )
+            return
+        }
 
-        val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
+        // Rotation: a fresh call fully replaces whatever was previously
+        // advertised — see radio module docs on why the *payload*
+        // rotating, not any link-layer address this app has no control
+        // over regardless, is what this backend can actually guarantee.
+        currentAdvertiseCallback?.let { advertiser.stopAdvertisingSet(it) }
+
+        val params = AdvertisingSetParameters.Builder()
+            .setLegacyMode(false)
             .setConnectable(true)
-            .build()
-        val data = AdvertiseData.Builder()
-            .addServiceUuid(ParcelUuid(SERVICE_UUID))
-            .addServiceData(ParcelUuid(SERVICE_UUID), token)
-            // Never advertise a device name — see radio module docs on
-            // why the advertised payload must carry nothing beyond the
-            // opaque token.
-            .setIncludeDeviceName(false)
+            // A non-legacy advertisement may be connectable or
+            // scannable, never both — connectable is what matters here,
+            // since peers need to open a GATT link to sync bundles.
+            .setScannable(false)
+            .setInterval(AdvertisingSetParameters.INTERVAL_MEDIUM)
+            .setTxPowerLevel(AdvertisingSetParameters.TX_POWER_MEDIUM)
             .build()
 
-        val callback = object : AdvertiseCallback() {
-            override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
-                nativeOnAdvertiseResult(requestId, true, null)
-            }
-            override fun onStartFailure(errorCode: Int) {
-                Log.w(TAG, "advertise failed, code=$errorCode")
-                nativeOnAdvertiseResult(requestId, false, "advertise failed, code=$errorCode")
+        val data = AdvertiseData.Builder()
+            .addServiceData(ParcelUuid(SERVICE_UUID), token)
+            // Never advertise a device name — the advertised payload
+            // must carry nothing beyond the opaque token.
+            .setIncludeDeviceName(false)
+            .setIncludeTxPowerLevel(false)
+            .build()
+
+        val callback = object : AdvertisingSetCallback() {
+            override fun onAdvertisingSetStarted(
+                advertisingSet: AdvertisingSet?,
+                txPower: Int,
+                status: Int,
+            ) {
+                if (status == ADVERTISE_SUCCESS) {
+                    nativeOnAdvertiseResult(requestId, true, null)
+                } else {
+                    Log.w(TAG, "extended advertise failed, status=$status")
+                    nativeOnAdvertiseResult(
+                        requestId, false, "extended advertise failed, status=$status"
+                    )
+                }
             }
         }
         currentAdvertiseCallback = callback
-        advertiser.startAdvertising(settings, data, callback)
+        advertiser.startAdvertisingSet(params, data, null, null, null, callback)
     }
 
     @JvmStatic
