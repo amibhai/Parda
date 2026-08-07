@@ -1,15 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
+
 import '../crypto/plaintext_handle.dart';
 import '../models/message.dart';
 import '../services/session_service.dart';
+import '../theme/app_theme.dart';
+import 'safety_number_screen.dart';
 
-/// End-to-end encrypted 1:1 chat UI.
-///
-/// Messages are displayed as chat bubbles. All crypto is handled by
-/// [SessionService] — this widget only shows decrypted plaintext
-/// that is already in local state.
+/// End-to-end encrypted 1:1 chat.
 class ChatScreen extends StatefulWidget {
   final String remoteUserId;
 
@@ -23,6 +22,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final _inputController = TextEditingController();
   final _scrollController = ScrollController();
   bool _sending = false;
+  int _lastMessageCount = 0;
 
   @override
   void dispose() {
@@ -36,11 +36,179 @@ class _ChatScreenState extends State<ChatScreen> {
       if (_scrollController.hasClients) {
         _scrollController.animateTo(
           _scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 250),
+          duration: const Duration(milliseconds: 220),
           curve: Curves.easeOut,
         );
       }
     });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final session = context.watch<SessionService>();
+    final msgs = session.messagesFor(widget.remoteUserId);
+    final localUserId = session.localUserId ?? '';
+
+    // Only auto-scroll when the conversation actually grew. Scrolling on
+    // every rebuild fought the user whenever they scrolled up to read
+    // back through history.
+    if (msgs.length != _lastMessageCount) {
+      _lastMessageCount = msgs.length;
+      _scrollToBottom();
+    }
+
+    return Scaffold(
+      appBar: AppBar(
+        titleSpacing: 0,
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Text(
+              widget.remoteUserId,
+              style: const TextStyle(
+                color: AppColors.textPrimary,
+                fontSize: 16,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            const SizedBox(height: 2),
+            Row(
+              children: [
+                const Icon(Icons.lock, size: 11, color: AppColors.secure),
+                const SizedBox(width: 4),
+                Text(
+                  'End-to-end encrypted',
+                  style: TextStyle(
+                    color: AppColors.secure.withValues(alpha: 0.9),
+                    fontSize: 11,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.verified_user_outlined, size: 21),
+            tooltip: 'Verify safety number',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (_) => SafetyNumberScreen(remoteUserId: widget.remoteUserId),
+              ),
+            ),
+          ),
+          PopupMenuButton<String>(
+            color: AppColors.surfaceHigh,
+            icon: const Icon(Icons.more_vert, size: 21),
+            onSelected: (v) {
+              if (v == 'burn') _confirmBurn(session);
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(
+                value: 'burn',
+                child: Row(
+                  children: [
+                    Icon(Icons.local_fire_department_outlined,
+                        size: 18, color: AppColors.danger),
+                    SizedBox(width: 10),
+                    Text('Burn conversation',
+                        style: TextStyle(color: AppColors.danger, fontSize: 14)),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ],
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(1),
+          child: Container(color: AppColors.border, height: 1),
+        ),
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: msgs.isEmpty
+                ? const _EmptyConversation()
+                : ListView.builder(
+                    controller: _scrollController,
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                    itemCount: msgs.length,
+                    itemBuilder: (ctx, i) => _ChatBubble(
+                      key: ValueKey(msgs[i].id),
+                      message: msgs[i],
+                      isMe: msgs[i].senderId == localUserId,
+                    ),
+                  ),
+          ),
+          _buildInputBar(session),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInputBar(SessionService session) {
+    final offline = session.relayStatus == RelayStatus.offline;
+    return Container(
+      decoration: const BoxDecoration(
+        color: AppColors.surface,
+        border: Border(top: BorderSide(color: AppColors.border)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: Column(
+          children: [
+            if (offline)
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 16),
+                color: AppColors.danger.withValues(alpha: 0.14),
+                child: const Text(
+                  'Relay unreachable — messages will fail to send',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: AppColors.danger, fontSize: 11.5),
+                ),
+              ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _inputController,
+                      style: const TextStyle(color: AppColors.textPrimary, fontSize: 15),
+                      maxLines: 5,
+                      minLines: 1,
+                      textCapitalization: TextCapitalization.sentences,
+                      decoration: InputDecoration(
+                        hintText: 'Encrypted message…',
+                        contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 16, vertical: 12),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(24),
+                          borderSide: const BorderSide(color: AppColors.border),
+                        ),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(24),
+                          borderSide: const BorderSide(color: AppColors.border),
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(24),
+                          borderSide: const BorderSide(color: AppColors.secure),
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  _SendButton(sending: _sending, onTap: _sendMessage),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   Future<void> _sendMessage() async {
@@ -52,13 +220,12 @@ class _ChatScreenState extends State<ChatScreen> {
 
     try {
       await context.read<SessionService>().sendMessage(widget.remoteUserId, body);
-      _scrollToBottom();
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Send failed: $e'),
-            backgroundColor: const Color(0xFFDA3633),
+            content: Text('Send failed: ${_friendly(e)}'),
+            backgroundColor: AppColors.danger,
           ),
         );
       }
@@ -67,275 +234,120 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final session = context.watch<SessionService>();
-    final msgs = session.messagesFor(widget.remoteUserId);
-    final localUserId = session.localUserId ?? '';
+  String _friendly(Object e) {
+    final t = e.toString();
+    if (t.contains('SocketException') || t.contains('TimeoutException')) {
+      return 'relay unreachable';
+    }
+    if (t.contains('No user') || t.contains('404')) {
+      return 'recipient not registered on this relay';
+    }
+    return t;
+  }
 
-    // Auto-scroll on new messages
-    if (msgs.isNotEmpty) _scrollToBottom();
-
-    return Scaffold(
-      backgroundColor: const Color(0xFF0D1117),
-      appBar: AppBar(
-        backgroundColor: const Color(0xFF161B22),
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back_ios, color: Colors.white),
-          onPressed: () => Navigator.of(context).pop(),
-        ),
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              widget.remoteUserId,
-              style: const TextStyle(
-                  color: Colors.white, fontSize: 16, fontWeight: FontWeight.w600),
-            ),
-            Row(
-              children: [
-                Container(
-                  width: 6,
-                  height: 6,
-                  decoration: const BoxDecoration(
-                    color: Color(0xFF00D084),
-                    shape: BoxShape.circle,
-                  ),
-                ),
-                const SizedBox(width: 4),
-                const Text(
-                  'End-to-end encrypted',
-                  style: TextStyle(color: Color(0xFF00D084), fontSize: 11),
-                ),
-              ],
-            ),
-          ],
+  Future<void> _confirmBurn(SessionService session) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Burn conversation?'),
+        content: const Text(
+          'Removes the session and all messages with this contact from this '
+          'device. You will need to start a new session to talk again.\n\n'
+          'This removes PARDA\'s own records. It cannot guarantee byte-level '
+          'erasure of key material inside libsignal.',
+          style: TextStyle(fontSize: 13.5, height: 1.45),
         ),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.lock, color: Color(0xFF00D084), size: 18),
-            onPressed: () => _showSecurityInfo(context),
-            tooltip: 'Security info',
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
           ),
-        ],
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(1),
-          child: Container(color: const Color(0xFF30363D), height: 1),
-        ),
-      ),
-      body: Column(
-        children: [
-          // Security notice banner
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 16),
-            color: const Color(0xFF0D1117),
-            child: Text(
-              '🔐  Messages are encrypted with Signal Protocol (Phase 1)',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: Colors.grey.shade600, fontSize: 11),
-            ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            style: TextButton.styleFrom(foregroundColor: AppColors.danger),
+            child: const Text('Burn'),
           ),
-
-          // Message list
-          Expanded(
-            child: msgs.isEmpty
-                ? Center(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(Icons.lock_clock, color: Colors.grey.shade700, size: 48),
-                        const SizedBox(height: 12),
-                        Text(
-                          'No messages yet.\nSend the first encrypted message.',
-                          textAlign: TextAlign.center,
-                          style: TextStyle(color: Colors.grey.shade600, fontSize: 14),
-                        ),
-                      ],
-                    ),
-                  )
-                : ListView.builder(
-                    controller: _scrollController,
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                    itemCount: msgs.length,
-                    itemBuilder: (ctx, i) {
-                      final msg = msgs[i];
-                      final isMe = msg.senderId == localUserId;
-                      return _ChatBubble(message: msg, isMe: isMe);
-                    },
-                  ),
-          ),
-
-          // Input bar
-          _buildInputBar(),
         ],
       ),
     );
+    if (confirmed != true) return;
+    await session.burnConversation(widget.remoteUserId);
+    if (mounted) Navigator.of(context).pop();
   }
+}
 
-  Widget _buildInputBar() {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      decoration: const BoxDecoration(
-        color: Color(0xFF161B22),
-        border: Border(top: BorderSide(color: Color(0xFF30363D))),
-      ),
-      child: SafeArea(
-        child: Row(
-          children: [
-            Expanded(
-              child: TextField(
-                controller: _inputController,
-                style: const TextStyle(color: Colors.white),
-                maxLines: 4,
-                minLines: 1,
-                textInputAction: TextInputAction.send,
-                onSubmitted: (_) => _sendMessage(),
-                decoration: InputDecoration(
-                  hintText: 'Encrypted message…',
-                  hintStyle: TextStyle(color: Colors.grey.shade600),
-                  filled: true,
-                  fillColor: const Color(0xFF0D1117),
-                  contentPadding:
-                      const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(24),
-                    borderSide: const BorderSide(color: Color(0xFF30363D)),
-                  ),
-                  enabledBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(24),
-                    borderSide: const BorderSide(color: Color(0xFF30363D)),
-                  ),
-                  focusedBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(24),
-                    borderSide: const BorderSide(color: Color(0xFF00D084)),
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(width: 10),
-            GestureDetector(
-              onTap: _sending ? null : _sendMessage,
-              child: AnimatedContainer(
-                duration: const Duration(milliseconds: 200),
-                width: 44,
-                height: 44,
-                decoration: BoxDecoration(
-                  gradient: _sending
-                      ? null
-                      : const LinearGradient(
-                          colors: [Color(0xFF00D084), Color(0xFF0066FF)],
-                          begin: Alignment.topLeft,
-                          end: Alignment.bottomRight,
-                        ),
-                  color: _sending ? const Color(0xFF30363D) : null,
-                  shape: BoxShape.circle,
-                  boxShadow: _sending
-                      ? null
-                      : [
-                          BoxShadow(
-                            color: const Color(0xFF00D084).withOpacity(0.4),
-                            blurRadius: 12,
-                            spreadRadius: 2,
-                          ),
-                        ],
-                ),
-                child: _sending
-                    ? const Padding(
-                        padding: EdgeInsets.all(12),
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: Colors.white,
-                        ),
-                      )
-                    : const Icon(Icons.send_rounded, color: Colors.white, size: 20),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
+class _EmptyConversation extends StatelessWidget {
+  const _EmptyConversation();
 
-  void _showSecurityInfo(BuildContext context) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: const Color(0xFF161B22),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (_) => Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(children: [
-              const Icon(Icons.lock, color: Color(0xFF00D084)),
-              const SizedBox(width: 8),
+  @override
+  Widget build(BuildContext context) => Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 48),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.lock_outline, size: 42, color: AppColors.textMuted.withValues(alpha: 0.6)),
+              const SizedBox(height: 16),
               const Text(
-                'Security Details',
+                'Messages are end-to-end encrypted',
+                textAlign: TextAlign.center,
                 style: TextStyle(
-                    color: Colors.white, fontSize: 18, fontWeight: FontWeight.w600),
+                  color: AppColors.textSecondary,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
-            ]),
-            const SizedBox(height: 16),
-            _secInfoRow('Protocol', 'Signal Protocol (X3DH + Double Ratchet)'),
-            _secInfoRow('Key Exchange', 'X25519 Elliptic Curve Diffie-Hellman'),
-            _secInfoRow('Encryption', 'AES-256-CBC + HMAC-SHA256'),
-            _secInfoRow('Forward Secrecy', 'Per-message ephemeral keys'),
-            _secInfoRow('Key Storage', 'Android Keystore / iOS Secure Enclave'),
-            const SizedBox(height: 16),
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.amber.shade900.withOpacity(0.2),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: Colors.amber.shade800.withOpacity(0.4)),
+              const SizedBox(height: 8),
+              const Text(
+                'Verify the safety number in person to be sure nobody '
+                'substituted keys when this conversation started.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: AppColors.textMuted, fontSize: 12.5, height: 1.5),
               ),
-              child: Text(
-                '⚠ Research prototype. Not certified for operational use.\n'
-                'No CNSA 2.0 or FIPS 140-3 compliance in Phase 1.',
-                style: TextStyle(color: Colors.amber.shade600, fontSize: 12),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _secInfoRow(String label, String value) => Padding(
-        padding: const EdgeInsets.symmetric(vertical: 4),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            SizedBox(
-              width: 120,
-              child: Text(label, style: TextStyle(color: Colors.grey.shade500, fontSize: 13)),
-            ),
-            Expanded(
-              child: Text(value, style: const TextStyle(color: Colors.white, fontSize: 13)),
-            ),
-          ],
+            ],
+          ),
         ),
       );
 }
 
-// ─── Chat bubble widget ───────────────────────────────────────────────────────
+class _SendButton extends StatelessWidget {
+  final bool sending;
+  final VoidCallback onTap;
+  const _SendButton({required this.sending, required this.onTap});
 
-/// A [StatefulWidget], not [StatelessWidget], specifically so a received
-/// message's plaintext can be fetched once via [PlaintextHandle.renderCopy]
-/// in [initState] and cached in local widget state — see
-/// `SessionService`'s class docs (Sub-Phase 4.5C) for why the native
-/// handle itself lives longer than this widget, and `models/message.dart`
-/// for why sent messages skip this path entirely (their `body` is
-/// already a plain Dart `String`, never crossed a decrypt boundary).
+  @override
+  Widget build(BuildContext context) => GestureDetector(
+        onTap: sending ? null : onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          width: 46,
+          height: 46,
+          decoration: BoxDecoration(
+            gradient: sending ? null : AppColors.brandGradient,
+            color: sending ? AppColors.surfaceHigh : null,
+            shape: BoxShape.circle,
+          ),
+          child: sending
+              ? const Padding(
+                  padding: EdgeInsets.all(13),
+                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white70),
+                )
+              : const Icon(Icons.arrow_upward_rounded, color: Colors.white, size: 22),
+        ),
+      );
+}
+
+// ─── Chat bubble ─────────────────────────────────────────────────────────────
+
+/// Stateful so a received message's plaintext can be read once from its
+/// native handle and cached in widget state — see `SessionService`'s
+/// docs for why the handle itself outlives this widget, and
+/// `models/message.dart` for why sent messages skip this path.
 class _ChatBubble extends StatefulWidget {
   final Message message;
   final bool isMe;
 
-  const _ChatBubble({required this.message, required this.isMe});
+  const _ChatBubble({super.key, required this.message, required this.isMe});
 
   @override
   State<_ChatBubble> createState() => _ChatBubbleState();
@@ -343,87 +355,101 @@ class _ChatBubble extends StatefulWidget {
 
 class _ChatBubbleState extends State<_ChatBubble> {
   String? _renderedBody;
+  bool _unavailable = false;
 
   @override
   void initState() {
     super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
     if (widget.message.body != null) {
       _renderedBody = widget.message.body;
-    } else {
-      final handleId = widget.message.plaintextHandleId;
-      if (handleId != null) {
-        PlaintextHandle(handleId).renderCopy().then((body) {
-          if (mounted) setState(() => _renderedBody = body);
-        });
-      }
+      return;
     }
+    final handleId = widget.message.plaintextHandleId;
+    if (handleId == null) {
+      _unavailable = true;
+      return;
+    }
+    final body = await PlaintextHandle(handleId).renderCopy();
+    if (!mounted) return;
+    setState(() {
+      _renderedBody = body;
+      // A released handle returns null. Saying so beats an ellipsis that
+      // never resolves.
+      _unavailable = body == null;
+    });
   }
 
   @override
   Widget build(BuildContext context) {
-    final message = widget.message;
     final isMe = widget.isMe;
+    final failed = widget.message.status == MessageStatus.failed;
+
     return Align(
       alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        margin: EdgeInsets.only(
-          top: 4,
-          bottom: 4,
-          left: isMe ? 60 : 0,
-          right: isMe ? 0 : 60,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * 0.78,
         ),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        decoration: BoxDecoration(
-          gradient: isMe
-              ? const LinearGradient(
-                  colors: [Color(0xFF0066FF), Color(0xFF004DCC)],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                )
-              : null,
-          color: isMe ? null : const Color(0xFF21262D),
-          borderRadius: BorderRadius.only(
-            topLeft: const Radius.circular(18),
-            topRight: const Radius.circular(18),
-            bottomLeft: Radius.circular(isMe ? 18 : 4),
-            bottomRight: Radius.circular(isMe ? 4 : 18),
+        child: Container(
+          margin: const EdgeInsets.symmetric(vertical: 3),
+          padding: const EdgeInsets.fromLTRB(14, 10, 14, 8),
+          decoration: BoxDecoration(
+            gradient: isMe && !failed
+                ? const LinearGradient(
+                    colors: [AppColors.accent, Color(0xFF004DCC)],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  )
+                : null,
+            color: failed
+                ? AppColors.danger.withValues(alpha: 0.18)
+                : (isMe ? null : AppColors.surfaceHigh),
+            border: failed
+                ? Border.all(color: AppColors.danger.withValues(alpha: 0.5))
+                : null,
+            borderRadius: BorderRadius.only(
+              topLeft: const Radius.circular(18),
+              topRight: const Radius.circular(18),
+              bottomLeft: Radius.circular(isMe ? 18 : 5),
+              bottomRight: Radius.circular(isMe ? 5 : 18),
+            ),
           ),
-          boxShadow: isMe
-              ? [
-                  BoxShadow(
-                    color: const Color(0xFF0066FF).withOpacity(0.25),
-                    blurRadius: 8,
-                    offset: const Offset(0, 2),
-                  ),
-                ]
-              : null,
-        ),
-        child: Column(
-          crossAxisAlignment:
-              isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-          children: [
-            Text(
-              _renderedBody ?? '…',
-              style: const TextStyle(color: Colors.white, fontSize: 15),
-            ),
-            const SizedBox(height: 4),
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  DateFormat('HH:mm').format(message.timestamp),
-                  style: TextStyle(
-                    color: Colors.white.withOpacity(0.5),
-                    fontSize: 11,
-                  ),
+          child: Column(
+            crossAxisAlignment:
+                isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+            children: [
+              Text(
+                _unavailable ? 'Message no longer available' : (_renderedBody ?? '…'),
+                style: TextStyle(
+                  color: _unavailable ? AppColors.textMuted : Colors.white,
+                  fontSize: 15,
+                  height: 1.35,
+                  fontStyle: _unavailable ? FontStyle.italic : FontStyle.normal,
                 ),
-                if (isMe) ...[
-                  const SizedBox(width: 4),
-                  _statusIcon(message.status),
+              ),
+              const SizedBox(height: 4),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    DateFormat('HH:mm').format(widget.message.timestamp),
+                    style: TextStyle(
+                      color: Colors.white.withValues(alpha: 0.55),
+                      fontSize: 10.5,
+                    ),
+                  ),
+                  if (isMe) ...[
+                    const SizedBox(width: 5),
+                    _statusIcon(widget.message.status),
+                  ],
                 ],
-              ],
-            ),
-          ],
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -433,16 +459,16 @@ class _ChatBubbleState extends State<_ChatBubble> {
     switch (status) {
       case MessageStatus.sending:
         return const SizedBox(
-          width: 12,
-          height: 12,
-          child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.white54),
+          width: 11,
+          height: 11,
+          child: CircularProgressIndicator(strokeWidth: 1.4, color: Colors.white54),
         );
       case MessageStatus.sent:
-        return const Icon(Icons.check, size: 13, color: Colors.white54);
+        return const Icon(Icons.check, size: 12, color: Colors.white54);
       case MessageStatus.delivered:
-        return const Icon(Icons.done_all, size: 13, color: Color(0xFF00D084));
+        return const Icon(Icons.done_all, size: 12, color: AppColors.secure);
       case MessageStatus.failed:
-        return const Icon(Icons.error_outline, size: 13, color: Color(0xFFDA3633));
+        return const Icon(Icons.error_outline, size: 12, color: AppColors.danger);
       case MessageStatus.received:
         return const SizedBox.shrink();
     }
