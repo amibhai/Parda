@@ -34,7 +34,7 @@ async fn main() {
         panic!("PARDA_GATEWAY_BIND is not a valid socket address ({bind_addr}): {e}")
     });
 
-    tracing::info!(%addr, relay = %relay_url, "parda-gateway listening");
+    tracing::info!(%addr, relay = %relay_url, "starting parda-gateway");
 
     parda_tls::serve(addr, app_with_security(state, security), &tls)
         .await
