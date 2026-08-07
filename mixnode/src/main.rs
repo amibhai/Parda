@@ -63,7 +63,7 @@ async fn main() {
     let tls = parda_tls::TlsSettings::from_env()
         .unwrap_or_else(|e| panic!("TLS configuration error: {e}"));
 
-    tracing::info!(%addr, "parda-mixnode listening");
+    tracing::info!(%addr, "starting parda-mixnode");
 
     parda_tls::serve(addr, app(state), &tls)
         .await

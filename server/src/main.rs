@@ -65,7 +65,7 @@ async fn main() {
     let tls = parda_tls::TlsSettings::from_env()
         .unwrap_or_else(|e| panic!("TLS configuration error: {e}"));
 
-    tracing::info!(%addr, "PARDA relay server listening");
+    tracing::info!(%addr, "starting PARDA relay server");
     tracing::warn!(
         "Sender metadata is hidden only for envelopes sent with sealed_sender = true. \
          Phase 1 peers, and any Phase 2 peer not opting in, remain visible to this relay."

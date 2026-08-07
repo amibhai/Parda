@@ -185,14 +185,25 @@ pub async fn serve(addr: SocketAddr, app: Router, settings: &TlsSettings) -> Res
     settings.log_posture();
 
     match settings.build_config().await? {
-        Some(config) => axum_server::bind_rustls(addr, config)
-            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-            .await
-            .map_err(|e| TlsError::Serve(e.to_string())),
+        Some(config) => {
+            // `axum_server::bind_rustls` defers the actual bind until the
+            // returned server is awaited, so there is no earlier point at
+            // which a successful bind can be confirmed here.
+            tracing::info!(%addr, "listening (TLS)");
+            axum_server::bind_rustls(addr, config)
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .map_err(|e| TlsError::Serve(e.to_string()))
+        }
         None => {
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .map_err(|e| TlsError::Serve(format!("failed to bind {addr}: {e}")))?;
+            // Logged only once the bind has actually succeeded — a server
+            // that announces it is listening and then dies on a port
+            // conflict sends whoever is reading the logs after the wrong
+            // problem.
+            tracing::info!(addr = %listener.local_addr().unwrap_or(addr), "listening");
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
