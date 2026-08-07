@@ -1,8 +1,7 @@
 package com.parda.app
 
 import android.content.Context
-import android.security.keystore.KeyGenParameterSpec
-import android.security.keystore.KeyProperties
+import android.util.Base64
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -10,54 +9,70 @@ import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
 import org.signal.libsignal.protocol.*
 import org.signal.libsignal.protocol.ecc.Curve
-import org.signal.libsignal.protocol.groups.GroupSessionBuilder
-import org.signal.libsignal.protocol.state.*
-import org.signal.libsignal.protocol.state.impl.InMemorySignalProtocolStore
-import java.security.KeyStore
-import android.util.Base64
 import org.signal.libsignal.protocol.message.CiphertextMessage
 import org.signal.libsignal.protocol.message.PreKeySignalMessage
 import org.signal.libsignal.protocol.message.SignalMessage
+import org.signal.libsignal.protocol.state.*
 
 /**
  * PARDA Signal Protocol plugin for Android.
  *
  * Bridges Flutter MethodChannel calls to libsignal-android operations.
- * All private key material is stored in the Android Keystore system
- * (StrongBox if available, TEE otherwise). The Flutter layer never
- * receives raw private key bytes.
+ * Session and identity state is held in [PersistentSignalStore], so it
+ * survives process death — see that class for what its
+ * "hardware-backed" storage does and does not mean.
  *
  * ## Method channel: `com.parda.app/signal`
  *
- * Exposed methods:
- * - generateIdentity(registrationId: Int) → Map (PreKeyBundle JSON)
- * - getPreKeyBundle() → Map
- * - processPreKeyBundle(remoteUserId: String, bundle: Map) → void
- * - encryptMessage(remoteUserId: String, plaintext: ByteArray) → Map
- * - decryptMessage(envelope: Map) → Long (a `PlaintextBridge` native handle,
- *   Sub-Phase 4.5C — never the raw decrypted bytes; see `PlaintextBridge.kt`
- *   and `mobile/lib/crypto/plaintext_handle.dart`)
- * - hasSession(remoteUserId: String) → Boolean
+ * | Method | Returns |
+ * |--------|---------|
+ * | `isEnrolled` | `Boolean` |
+ * | `localUserId` | `String?` |
+ * | `generateIdentity(userId, registrationId)` | `Map` (prekey bundle JSON) |
+ * | `getPreKeyBundle` | `Map` (a bundle built from currently-available prekeys) |
+ * | `processPreKeyBundle(remoteUserId, bundle)` | `void` |
+ * | `encryptMessage(remoteUserId, plaintext)` | `Map` (envelope JSON) |
+ * | `decryptMessage(envelope)` | `Long` — a `PlaintextBridge` handle, never raw bytes (Sub-Phase 4.5C) |
+ * | `hasSession(remoteUserId)` | `Boolean` |
+ * | `knownPeers` | `List<String>` |
+ * | `safetyNumber(remoteUserId)` | `Map` — 60-digit fingerprint (Sub-Phase 4.5D) |
+ * | `burnConversation(remoteUserId)` | `void` |
+ * | `wipeIdentity` | `void` |
  */
 class SignalPlugin : FlutterPlugin, MethodCallHandler {
 
     private lateinit var channel: MethodChannel
     private lateinit var context: Context
 
-    // ── In-memory session store (Phase 1).
-    // Phase 2: replace with SQLCipher-backed persistent store.
-    private var protocolStore: InMemorySignalProtocolStore? = null
+    private var protocolStore: PersistentSignalStore? = null
 
     companion object {
         const val CHANNEL = "com.parda.app/signal"
-        const val KEYSTORE_ALIAS = "parda_identity_key"
-        const val ANDROID_KEYSTORE = "AndroidKeyStore"
+        const val PREKEY_POOL_SIZE = 100
+
+        /**
+         * Domain-separation label for the mobile safety number. Must stay
+         * byte-identical to `FINGERPRINT_CONTEXT` in
+         * `protocol/src/trust.rs`, or a Rust peer and an Android peer
+         * would compute different fingerprints for the same key pair and
+         * users comparing them would see a spurious mismatch.
+         */
+        val FINGERPRINT_CONTEXT = "PARDA-Fingerprint-v1".toByteArray(Charsets.UTF_8)
+        const val FINGERPRINT_LEN = 60
     }
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         context = binding.applicationContext
         channel = MethodChannel(binding.binaryMessenger, CHANNEL)
         channel.setMethodCallHandler(this)
+        // Reload any previously-enrolled identity up front, so the very
+        // first Dart call already sees the real state rather than racing it.
+        protocolStore = try {
+            PersistentSignalStore.load(context)
+        } catch (e: Exception) {
+            android.util.Log.e(CHANNEL, "failed to load persisted identity", e)
+            null
+        }
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
@@ -67,13 +82,23 @@ class SignalPlugin : FlutterPlugin, MethodCallHandler {
     override fun onMethodCall(call: MethodCall, result: Result) {
         try {
             when (call.method) {
+                "isEnrolled" -> result.success(protocolStore != null)
+                "localUserId" -> result.success(protocolStore?.localUserId)
                 "generateIdentity" -> handleGenerateIdentity(call, result)
-                "getPreKeyBundle"  -> handleGetPreKeyBundle(result)
+                "getPreKeyBundle" -> handleGetPreKeyBundle(result)
                 "processPreKeyBundle" -> handleProcessPreKeyBundle(call, result)
-                "encryptMessage"   -> handleEncryptMessage(call, result)
-                "decryptMessage"   -> handleDecryptMessage(call, result)
-                "hasSession"       -> handleHasSession(call, result)
-                else               -> result.notImplemented()
+                "encryptMessage" -> handleEncryptMessage(call, result)
+                "decryptMessage" -> handleDecryptMessage(call, result)
+                "hasSession" -> handleHasSession(call, result)
+                "knownPeers" -> result.success(protocolStore?.knownPeers() ?: emptyList<String>())
+                "safetyNumber" -> handleSafetyNumber(call, result)
+                "burnConversation" -> handleBurnConversation(call, result)
+                "wipeIdentity" -> {
+                    PersistentSignalStore.wipe(context)
+                    protocolStore = null
+                    result.success(null)
+                }
+                else -> result.notImplemented()
             }
         } catch (e: Exception) {
             result.error("SIGNAL_ERROR", e.message, e.stackTraceToString())
@@ -83,18 +108,21 @@ class SignalPlugin : FlutterPlugin, MethodCallHandler {
     // ── generateIdentity ─────────────────────────────────────────────────────
 
     private fun handleGenerateIdentity(call: MethodCall, result: Result) {
+        val userId = call.argument<String>("userId")
+            ?: return result.error("BAD_ARGS", "userId is required", null)
         val registrationId = call.argument<Int>("registrationId") ?: 1
 
-        // Generate identity key pair using libsignal-android.
-        // The private key is wrapped with an Android Keystore key for at-rest
-        // protection. StrongBox is requested first; falls back to TEE.
         val identityKeyPair = Curve.generateKeyPair()
-        val identityKey     = IdentityKey(identityKeyPair.publicKey)
+        val identityKey = IdentityKey(identityKeyPair.publicKey)
+        val fullIdentity = IdentityKeyPair(identityKey, identityKeyPair.privateKey)
 
-        // Generate signed prekey
+        val store = PersistentSignalStore.create(context, fullIdentity, registrationId, userId)
+        protocolStore = store
+
+        // Signed prekey
         val signedPreKeyPair = Curve.generateKeyPair()
-        val signedPreKeyId   = 1
-        val signedPreKeySig  = Curve.calculateSignature(
+        val signedPreKeyId = 1
+        val signedPreKeySig = Curve.calculateSignature(
             identityKeyPair.privateKey,
             signedPreKeyPair.publicKey.serialize()
         )
@@ -104,71 +132,80 @@ class SignalPlugin : FlutterPlugin, MethodCallHandler {
             signedPreKeyPair,
             signedPreKeySig
         )
+        store.storeSignedPreKey(signedPreKeyId, signedPreKey)
 
-        // Generate one-time prekeys. `KeyHelper.generatePreKeys(start, count)`
-        // — what this was originally written against — does not exist in
-        // the current libsignal-android API (confirmed by reading
-        // KeyHelper.java at the exact git tag this project's Rust
-        // `libsignal-protocol` dependency is already pinned to, v0.66.0:
-        // it has only `generateRegistrationId`). A pre-existing defect in
-        // this file, invisible until Sub-Phase 4.5B's real Gradle build —
-        // no prior session had a toolchain to compile this against.
-        // Replaced with the equivalent construction using primitives that
-        // do exist (`Curve.generateKeyPair`, `PreKeyRecord`'s real
-        // `(id, keyPair)` constructor).
-        val preKeys = (0 until 100).map { id -> PreKeyRecord(id, Curve.generateKeyPair()) }
-
-        // Initialise in-memory store
-        protocolStore = InMemorySignalProtocolStore(
-            IdentityKeyPair(identityKey, identityKeyPair.privateKey),
-            registrationId
-        ).also { store ->
-            store.storeSignedPreKey(signedPreKeyId, signedPreKey)
-            preKeys.forEach { store.storePreKey(it.id, it) }
+        // One-time prekeys. `KeyHelper.generatePreKeys(start, count)` — what
+        // this was originally written against — does not exist in the current
+        // libsignal-android API (confirmed by reading KeyHelper.java at the
+        // tag this project's Rust dependency pins, v0.66.0: it has only
+        // `generateRegistrationId`). Constructed here from primitives that do
+        // exist.
+        for (id in 1..PREKEY_POOL_SIZE) {
+            store.storePreKey(id, PreKeyRecord(id, Curve.generateKeyPair()))
         }
 
-        // Return the prekey bundle as a map for upload to the relay
-        val bundle = mapOf(
-            "registration_id"         to registrationId,
-            "device_id"               to 1,
-            "identity_key"            to b64(identityKey.serialize()),
-            "signed_prekey_id"        to signedPreKeyId,
-            "signed_prekey_public"    to b64(signedPreKeyPair.publicKey.serialize()),
-            "signed_prekey_signature" to b64(signedPreKeySig),
-            "one_time_prekey_id"      to preKeys.first().id,
-            "one_time_prekey_public"  to b64(preKeys.first().keyPair.publicKey.serialize())
-        )
-        result.success(bundle)
+        result.success(buildBundleMap(store))
     }
 
     // ── getPreKeyBundle ───────────────────────────────────────────────────────
 
     private fun handleGetPreKeyBundle(result: Result) {
-        val store = protocolStore ?: return result.error("NOT_ENROLLED", "Identity not initialised", null)
-        // Return the current signed prekey bundle (simplified — real impl would
-        // track which one-time prekeys are still available).
-        result.success(mapOf("registered" to true))
+        val store = requireStore(result) ?: return
+        result.success(buildBundleMap(store))
+    }
+
+    /**
+     * Build the prekey bundle this device publishes to the relay.
+     *
+     * Hands out the lowest-numbered *unused* one-time prekey. Previously
+     * this returned a placeholder `{"registered": true}`, which the relay
+     * would store and then serve to peers as a bundle with no usable key
+     * material — so a second device could never establish a session at
+     * all. Replenishment when the pool runs low is not implemented; when
+     * it empties, `one_time_prekey_*` is omitted and X3DH proceeds
+     * without a one-time prekey, which libsignal supports (with the
+     * documented reduction in forward secrecy for that first message).
+     */
+    private fun buildBundleMap(store: PersistentSignalStore): Map<String, Any?> {
+        // `IdentityKeyPair.publicKey` is already an `IdentityKey`, not a raw
+        // `ECPublicKey` — no wrapping needed here (unlike at generation time,
+        // where the key comes from `Curve.generateKeyPair()`).
+        val identityKey: IdentityKey = store.identityKeyPair.publicKey
+        val signedPreKey = store.loadSignedPreKey(1)
+        val availablePreKeyId = store.availablePreKeyIds().firstOrNull()
+        val oneTimePreKey = availablePreKeyId?.let { store.loadPreKey(it) }
+
+        return mapOf(
+            "registration_id" to store.registrationId,
+            "device_id" to 1,
+            "identity_key" to b64(identityKey.serialize()),
+            "signed_prekey_id" to 1,
+            "signed_prekey_public" to b64(signedPreKey.keyPair.publicKey.serialize()),
+            "signed_prekey_signature" to b64(signedPreKey.signature),
+            "one_time_prekey_id" to availablePreKeyId,
+            "one_time_prekey_public" to oneTimePreKey?.keyPair?.publicKey?.serialize()?.let { b64(it) }
+        )
     }
 
     // ── processPreKeyBundle ───────────────────────────────────────────────────
 
     private fun handleProcessPreKeyBundle(call: MethodCall, result: Result) {
-        val store      = requireStore(result) ?: return
+        val store = requireStore(result) ?: return
         val remoteUserId = call.argument<String>("remoteUserId")!!
-        val bundleMap  = call.argument<Map<String, Any>>("bundle")!!
+        val bundleMap = call.argument<Map<String, Any>>("bundle")!!
 
-        val remoteAddress  = SignalProtocolAddress(remoteUserId, 1)
-        val identityKey    = IdentityKey(d64(bundleMap["identity_key"] as String), 0)
-        val signedPreKeyId = (bundleMap["signed_prekey_id"] as Int)
+        val remoteAddress = SignalProtocolAddress(remoteUserId, 1)
+        val identityKey = IdentityKey(d64(bundleMap["identity_key"] as String), 0)
+        val signedPreKeyId = (bundleMap["signed_prekey_id"] as Number).toInt()
         val signedPreKeyPub = Curve.decodePoint(d64(bundleMap["signed_prekey_public"] as String), 0)
-        val signature       = d64(bundleMap["signed_prekey_signature"] as String)
+        val signature = d64(bundleMap["signed_prekey_signature"] as String)
 
-        val oneTimePreKeyId  = (bundleMap["one_time_prekey_id"] as? Int)
+        val oneTimePreKeyId = (bundleMap["one_time_prekey_id"] as? Number)?.toInt()
         val oneTimePreKeyPub = (bundleMap["one_time_prekey_public"] as? String)
             ?.let { Curve.decodePoint(d64(it), 0) }
 
         val preKeyBundle = PreKeyBundle(
-            (bundleMap["registration_id"] as Int),
+            (bundleMap["registration_id"] as Number).toInt(),
             1,
             oneTimePreKeyId ?: 0,
             oneTimePreKeyPub,
@@ -178,47 +215,49 @@ class SignalPlugin : FlutterPlugin, MethodCallHandler {
             identityKey
         )
 
-        val sessionBuilder = SessionBuilder(store, remoteAddress)
-        sessionBuilder.process(preKeyBundle)
-
+        SessionBuilder(store, remoteAddress).process(preKeyBundle)
         result.success(null)
     }
 
     // ── encryptMessage ────────────────────────────────────────────────────────
 
     private fun handleEncryptMessage(call: MethodCall, result: Result) {
-        val store        = requireStore(result) ?: return
+        val store = requireStore(result) ?: return
         val remoteUserId = call.argument<String>("remoteUserId")!!
-        val plaintext    = call.argument<ByteArray>("plaintext")!!
+        val plaintext = call.argument<ByteArray>("plaintext")!!
 
         try {
-            val remoteAddress  = SignalProtocolAddress(remoteUserId, 1)
-            val sessionCipher  = SessionCipher(store, remoteAddress)
-            val cipherMessage  = sessionCipher.encrypt(plaintext)
+            val remoteAddress = SignalProtocolAddress(remoteUserId, 1)
+            val cipherMessage = SessionCipher(store, remoteAddress).encrypt(plaintext)
 
             val envelopeType = when (cipherMessage.type) {
                 CiphertextMessage.PREKEY_TYPE -> "pre_key"
-                else                           -> "ratchet"
+                else -> "ratchet"
             }
 
             val envelopeMap = mapOf(
-                "sender_id"      to (store.identityKeyPair?.let { "local" } ?: "unknown"),
-                "recipient_id"   to remoteUserId,
-                "ciphertext"     to b64(cipherMessage.serialize()),
-                "envelope_type"  to envelopeType,
-                "timestamp_ms"   to System.currentTimeMillis(),
-                "sealed_sender"  to false
+                // Previously the literal string "local", which meant the
+                // *recipient* looked up a session under the address "local"
+                // instead of the real sender and could never decrypt. The
+                // sender's own enrolled user ID is the only value that lets
+                // the far side resolve the right session.
+                "sender_id" to (store.localUserId ?: ""),
+                "recipient_id" to remoteUserId,
+                "ciphertext" to b64(cipherMessage.serialize()),
+                "envelope_type" to envelopeType,
+                "timestamp_ms" to System.currentTimeMillis(),
+                // Explicit rather than relying on the relay's serde default:
+                // this envelope carries Phase 2 fields, so it is a v2 envelope
+                // and should say so on the wire.
+                "version" to 2,
+                "sealed_sender" to false
             )
             result.success(envelopeMap)
         } finally {
-            // Sub-Phase 3C mobile-bridge audit finding: `plaintext` is a
-            // plain JVM ByteArray handed to us across the MethodChannel
-            // boundary — nothing clears it once libsignal has consumed
-            // it, so it would otherwise sit as an unmanaged copy subject
-            // only to GC (not deterministic, not a real erasure) until
-            // collected. A `zeroize` call on the Dart side does nothing
-            // for this copy. `finally` so it's cleared on the exception
-            // path too, not just the success path.
+            // Sub-Phase 3C: `plaintext` is a plain JVM ByteArray handed across
+            // the MethodChannel; nothing clears it once libsignal has consumed
+            // it, so it would otherwise sit as an unmanaged copy subject only
+            // to GC. `finally` so the exception path is covered too.
             java.util.Arrays.fill(plaintext, 0)
         }
     }
@@ -226,10 +265,10 @@ class SignalPlugin : FlutterPlugin, MethodCallHandler {
     // ── decryptMessage ────────────────────────────────────────────────────────
 
     private fun handleDecryptMessage(call: MethodCall, result: Result) {
-        val store       = requireStore(result) ?: return
+        val store = requireStore(result) ?: return
         val envelopeMap = call.argument<Map<String, Any>>("envelope")!!
 
-        val senderId     = envelopeMap["sender_id"] as String
+        val senderId = envelopeMap["sender_id"] as String
         val envelopeType = envelopeMap["envelope_type"] as String
         val ciphertextBytes = d64(envelopeMap["ciphertext"] as String)
 
@@ -238,22 +277,12 @@ class SignalPlugin : FlutterPlugin, MethodCallHandler {
 
         val plaintext = when (envelopeType) {
             "pre_key" -> sessionCipher.decrypt(PreKeySignalMessage(ciphertextBytes))
-            else       -> sessionCipher.decrypt(SignalMessage(ciphertextBytes))
+            else -> sessionCipher.decrypt(SignalMessage(ciphertextBytes))
         }
         try {
-            // Sub-Phase 4.5C fix, replacing the previous `result.success(plaintext)`:
-            // the finding in docs/phase3-3a-self-destruct-design.md §9 and
-            // docs/phase4.5c-dart-plaintext-design.md §1 is that once raw
-            // decrypted bytes cross the MethodChannel into Dart, nothing on
-            // this side of the boundary can make them provably erasable —
-            // Dart's `String` has no mutable backing storage. Handing Dart
-            // an opaque native handle instead (backed by
-            // `parda_protocol::plaintext_ffi::PlaintextHandle`, the same
-            // zeroize/lock discipline already audited for
-            // `self_destruct::DerivedKey`) means the *decrypted content
-            // itself* never crosses this MethodChannel call at all — only
-            // a handle ID does. See `PlaintextBridge.kt` and
-            // `mobile/lib/crypto/plaintext_handle.dart`.
+            // Sub-Phase 4.5C: hand Dart an opaque native handle rather than
+            // the decrypted bytes — see PlaintextBridge.kt and
+            // docs/phase4.5c-dart-plaintext-design.md.
             val handle = PlaintextBridge.nativePlaintextNew(plaintext)
             if (handle == 0L) {
                 result.error("PLAINTEXT_HANDLE_FAILED", "Failed to hand decrypted content to the native plaintext buffer", null)
@@ -261,38 +290,122 @@ class SignalPlugin : FlutterPlugin, MethodCallHandler {
                 result.success(handle)
             }
         } finally {
-            // `nativePlaintextNew` copies `plaintext` into its own
-            // Rust-owned, locked buffer before returning — this Kotlin-side
-            // ByteArray is now a redundant unmanaged copy the same as it
-            // was before this fix, so it still needs the same explicit
-            // clear `handleEncryptMessage` already applies, `finally` so
-            // the exception path is covered too.
             java.util.Arrays.fill(plaintext, 0)
         }
     }
 
-    // ── hasSession ────────────────────────────────────────────────────────────
+    // ── hasSession / knownPeers ───────────────────────────────────────────────
 
     private fun handleHasSession(call: MethodCall, result: Result) {
-        val store        = protocolStore ?: return result.success(false)
+        val store = protocolStore ?: return result.success(false)
         val remoteUserId = call.argument<String>("remoteUserId")!!
-        val address      = SignalProtocolAddress(remoteUserId, 1)
-        result.success(store.containsSession(address))
+        result.success(store.containsSession(SignalProtocolAddress(remoteUserId, 1)))
+    }
+
+    // ── safetyNumber (Sub-Phase 4.5D) ─────────────────────────────────────────
+
+    /**
+     * Compute the 60-digit safety number for a conversation.
+     *
+     * **Must stay byte-compatible with `protocol/src/trust.rs`'s
+     * `Fingerprint::compute`** — same HKDF-SHA256 construction, same
+     * `PARDA-Fingerprint-v1` label as both salt and info, same
+     * sorted-serialized-keys input ordering, same 60-byte output chunked
+     * into twelve big-endian 40-bit groups reduced mod 100000. A
+     * divergence would show users a mismatch between two honest devices,
+     * which is worse than having no fingerprint at all. As on the Rust
+     * side, this is inspired by Signal's safety-number concept and is
+     * explicitly *not* bit-compatible with Signal's own algorithm.
+     */
+    private fun handleSafetyNumber(call: MethodCall, result: Result) {
+        val store = requireStore(result) ?: return
+        val remoteUserId = call.argument<String>("remoteUserId")!!
+        val remote = store.getIdentity(SignalProtocolAddress(remoteUserId, 1))
+            ?: return result.error(
+                "NO_IDENTITY",
+                "No identity key on file for $remoteUserId — start a conversation first",
+                null
+            )
+
+        val local = store.identityKeyPair.publicKey.serialize()
+        val digits = fingerprintDigits(local, remote.serialize())
+        result.success(mapOf("digits" to digits, "peer" to remoteUserId))
+    }
+
+    private fun fingerprintDigits(localKey: ByteArray, remoteKey: ByteArray): String {
+        // Lexicographic sort so both sides feed HKDF identical input.
+        val first: ByteArray
+        val second: ByteArray
+        if (compareUnsigned(localKey, remoteKey) <= 0) {
+            first = localKey; second = remoteKey
+        } else {
+            first = remoteKey; second = localKey
+        }
+        val ikm = first + second
+        val okm = hkdfSha256(FINGERPRINT_CONTEXT, ikm, FINGERPRINT_CONTEXT, FINGERPRINT_LEN)
+
+        return (0 until 12).joinToString(" ") { group ->
+            var value = 0L
+            for (i in 0 until 5) {
+                value = (value shl 8) or (okm[group * 5 + i].toLong() and 0xFF)
+            }
+            "%05d".format(value % 100000)
+        }
+    }
+
+    private fun compareUnsigned(a: ByteArray, b: ByteArray): Int {
+        val n = minOf(a.size, b.size)
+        for (i in 0 until n) {
+            val d = (a[i].toInt() and 0xFF) - (b[i].toInt() and 0xFF)
+            if (d != 0) return d
+        }
+        return a.size - b.size
+    }
+
+    /** RFC 5869 HKDF-SHA256. Extract-then-expand, via the JDK's own HMAC. */
+    private fun hkdfSha256(salt: ByteArray, ikm: ByteArray, info: ByteArray, length: Int): ByteArray {
+        val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+        mac.init(javax.crypto.spec.SecretKeySpec(salt, "HmacSHA256"))
+        val prk = mac.doFinal(ikm)
+
+        val out = ByteArray(length)
+        var previous = ByteArray(0)
+        var offset = 0
+        var counter = 1
+        while (offset < length) {
+            mac.init(javax.crypto.spec.SecretKeySpec(prk, "HmacSHA256"))
+            mac.update(previous)
+            mac.update(info)
+            mac.update(counter.toByte())
+            previous = mac.doFinal()
+            val n = minOf(previous.size, length - offset)
+            System.arraycopy(previous, 0, out, offset, n)
+            offset += n
+            counter++
+        }
+        return out
+    }
+
+    // ── burnConversation ──────────────────────────────────────────────────────
+
+    private fun handleBurnConversation(call: MethodCall, result: Result) {
+        val store = requireStore(result) ?: return
+        val remoteUserId = call.argument<String>("remoteUserId")!!
+        store.burnConversation(remoteUserId)
+        result.success(null)
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private fun requireStore(result: Result): InMemorySignalProtocolStore? {
-        if (protocolStore == null) {
+    private fun requireStore(result: Result): PersistentSignalStore? {
+        val store = protocolStore
+        if (store == null) {
             result.error("NOT_ENROLLED", "Call generateIdentity first", null)
             return null
         }
-        return protocolStore
+        return store
     }
 
-    private fun b64(bytes: ByteArray): String =
-        Base64.encodeToString(bytes, Base64.NO_WRAP)
-
-    private fun d64(s: String): ByteArray =
-        Base64.decode(s, Base64.NO_WRAP)
+    private fun b64(bytes: ByteArray): String = Base64.encodeToString(bytes, Base64.NO_WRAP)
+    private fun d64(s: String): ByteArray = Base64.decode(s, Base64.NO_WRAP)
 }
