@@ -1,51 +1,54 @@
 import 'package:flutter/services.dart';
 
-/// Bridge to native libsignal-android / libsignal-swift via MethodChannel.
+/// Bridge to native libsignal-android via MethodChannel.
 ///
-/// All cryptographic operations are performed in native platform code, where:
-/// - Android: uses libsignal-android + Android Keystore (StrongBox if available)
-/// - iOS:     uses libsignal-swift + iOS Secure Enclave
+/// All cryptographic operations run in native platform code
+/// (`SignalPlugin.kt` → `org.signal.libsignal.protocol.*`). Identity and
+/// session state lives in `PersistentSignalStore`, encrypted at rest
+/// under an Android Keystore master key — see that class's docs for what
+/// that does and does not mean.
 ///
-/// The Dart layer never handles raw private key bytes. All key material
-/// stays inside the platform's hardware security module.
-///
-/// ## Method channel contract
-///
-/// The native plugin (`SignalPlugin.kt` / `SignalPlugin.swift`) exposes
-/// the following method channel calls:
-///
-/// | Method | Arguments | Returns |
-/// |--------|-----------|---------|
-/// | `generateIdentity` | `{ registrationId: int }` | `PreKeyBundleJson` |
-/// | `getPreKeyBundle` | — | `PreKeyBundleJson` |
-/// | `processPreKeyBundle` | `{ remoteUserId: String, bundle: Map }` | `void` |
-/// | `encryptMessage` | `{ remoteUserId: String, plaintext: Uint8List }` | `EnvelopeJson` |
-/// | `decryptMessage` | `{ envelope: Map }` | `int` (a [PlaintextHandle] ID — Sub-Phase 4.5C, see below) |
-/// | `hasSession` | `{ remoteUserId: String }` | `bool` |
+/// The Dart layer never handles raw private key bytes, and since
+/// Sub-Phase 4.5C it never handles decrypted message bytes either:
+/// [decryptMessage] returns an opaque native handle.
 class SignalBridge {
   static const MethodChannel _channel = MethodChannel('com.parda.app/signal');
 
-  /// Generate a new identity and upload a prekey bundle.
+  /// `true` if this device already holds a generated identity.
   ///
-  /// Must be called once on first launch. Returns the serialised prekey
-  /// bundle that should be uploaded to the relay server.
-  Future<Map<String, dynamic>> generateIdentity(int registrationId) async {
+  /// The authoritative enrollment check. Previously the app inferred
+  /// enrollment from a user ID stored on the Dart side, which could be
+  /// present while the native key store was empty — leaving the app
+  /// permanently stuck in a state where every send failed.
+  Future<bool> isEnrolled() async =>
+      await _channel.invokeMethod<bool>('isEnrolled') ?? false;
+
+  /// The enrolled user ID, or `null` if this device has not enrolled.
+  Future<String?> localUserId() async =>
+      await _channel.invokeMethod<String>('localUserId');
+
+  /// Generate a new identity, persist it, and return the prekey bundle
+  /// to publish to the relay. Replaces any existing identity.
+  Future<Map<String, dynamic>> generateIdentity(
+    String userId,
+    int registrationId,
+  ) async {
     final result = await _channel.invokeMethod<Map>('generateIdentity', {
+      'userId': userId,
       'registrationId': registrationId,
     });
     return Map<String, dynamic>.from(result!);
   }
 
-  /// Retrieve the locally-stored prekey bundle (for re-upload after server reset).
+  /// The current prekey bundle, rebuilt from live key material — used to
+  /// re-publish after a relay reset.
   Future<Map<String, dynamic>> getLocalPreKeyBundle() async {
     final result = await _channel.invokeMethod<Map>('getPreKeyBundle');
     return Map<String, dynamic>.from(result!);
   }
 
-  /// Initiate a session with a remote peer using their prekey bundle.
-  ///
-  /// Must be called before [encryptMessage] for a new contact.
-  /// Internally performs X3DH key agreement on the native side.
+  /// Perform X3DH against [bundle], establishing a session with
+  /// [remoteUserId].
   Future<void> processPreKeyBundle(
     String remoteUserId,
     Map<String, dynamic> bundle,
@@ -56,10 +59,8 @@ class SignalBridge {
     });
   }
 
-  /// Encrypt [plaintext] for [remoteUserId].
-  ///
-  /// Returns a map matching the `MessageEnvelope` JSON shape expected
-  /// by the relay server. The `ciphertext` field is base64-encoded.
+  /// Encrypt [plaintext] for [remoteUserId], returning a `MessageEnvelope`
+  /// JSON map ready to POST to the relay.
   Future<Map<String, dynamic>> encryptMessage(
     String remoteUserId,
     Uint8List plaintext,
@@ -71,16 +72,12 @@ class SignalBridge {
     return Map<String, dynamic>.from(result!);
   }
 
-  /// Decrypt an incoming envelope map fetched from the relay server.
+  /// Decrypt an incoming envelope.
   ///
-  /// Returns a native [PlaintextHandle] ID, **not** the decrypted bytes
-  /// themselves — Sub-Phase 4.5C's fix for the Dart plaintext problem
-  /// (see `docs/phase4.5c-dart-plaintext-design.md`): the decrypted
-  /// content stays behind a native, zeroize-on-release buffer
-  /// (`PlaintextBridge.kt` / `protocol::plaintext_ffi`) and only crosses
-  /// into a Dart-visible copy per-render, via [PlaintextHandle.renderCopy].
-  /// If the envelope is a PreKey message, the native side establishes a
-  /// new session automatically.
+  /// Returns a native `PlaintextHandle` ID, **not** the decrypted bytes —
+  /// Sub-Phase 4.5C's fix for the Dart plaintext problem. See
+  /// `plaintext_handle.dart` and
+  /// `docs/phase4.5c-dart-plaintext-design.md`.
   Future<int> decryptMessage(Map<String, dynamic> envelopeJson) async {
     final result = await _channel.invokeMethod<int>('decryptMessage', {
       'envelope': envelopeJson,
@@ -88,11 +85,45 @@ class SignalBridge {
     return result!;
   }
 
-  /// Returns `true` if an active session exists for [remoteUserId].
-  Future<bool> hasSession(String remoteUserId) async {
-    return await _channel.invokeMethod<bool>('hasSession', {
+  Future<bool> hasSession(String remoteUserId) async =>
+      await _channel.invokeMethod<bool>('hasSession', {
+        'remoteUserId': remoteUserId,
+      }) ??
+      false;
+
+  /// Every peer this device holds a session with — survives restart, so
+  /// the conversation list can be rebuilt after the app is killed.
+  Future<List<String>> knownPeers() async {
+    final result = await _channel.invokeMethod<List>('knownPeers');
+    return (result ?? const []).cast<String>();
+  }
+
+  /// The 60-digit safety number for a conversation (Sub-Phase 4.5D).
+  ///
+  /// Byte-compatible with `protocol/src/trust.rs`'s `Fingerprint` —
+  /// inspired by Signal's safety-number concept, explicitly not
+  /// bit-compatible with Signal's own algorithm.
+  Future<String> safetyNumber(String remoteUserId) async {
+    final result = await _channel.invokeMethod<Map>('safetyNumber', {
       'remoteUserId': remoteUserId,
-    }) ??
-        false;
+    });
+    return Map<String, dynamic>.from(result!)['digits'] as String;
+  }
+
+  /// Remove all session and trust state for one conversation.
+  ///
+  /// Carries the same documented limit as the Rust `burn_conversation`:
+  /// the conversation becomes unusable (real and observable), but
+  /// libsignal's own non-zeroizing internals may retain copies no code
+  /// here can reach. See `docs/phase3-3a-self-destruct-design.md` §12.
+  Future<void> burnConversation(String remoteUserId) async {
+    await _channel.invokeMethod<void>('burnConversation', {
+      'remoteUserId': remoteUserId,
+    });
+  }
+
+  /// Erase this device's identity entirely.
+  Future<void> wipeIdentity() async {
+    await _channel.invokeMethod<void>('wipeIdentity');
   }
 }

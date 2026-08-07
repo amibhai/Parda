@@ -309,6 +309,44 @@ mod tests {
         ));
     }
 
+    /// Known-answer test pinning the exact fingerprint construction.
+    ///
+    /// **This is a cross-implementation contract, not just a regression
+    /// guard.** `mobile/android/app/src/main/kotlin/com/parda/app/SignalPlugin.kt`
+    /// reimplements this construction in Kotlin (it cannot call into
+    /// this crate — the Android client uses libsignal-android, not the
+    /// Rust stack), so the two must agree byte-for-byte or two honest
+    /// devices would show their users different safety numbers, which is
+    /// worse than showing none.
+    ///
+    /// The vector below was captured from a real cross-implementation
+    /// run: these are the two identity keys a Pixel 8 running the
+    /// Android client and a `parda-cli peer` published to a live relay,
+    /// and the expected digits are what the Android UI actually
+    /// displayed. Changing the construction breaks this test, which is
+    /// the point — the Kotlin side would need the identical change.
+    #[test]
+    fn fingerprint_matches_the_android_implementation_known_answer() {
+        use base64::Engine as _;
+        let decode = |s: &str| {
+            base64::engine::general_purpose::STANDARD
+                .decode(s)
+                .expect("valid base64 test vector")
+        };
+
+        let a = IdentityKey::decode(&decode("Ba/PJNiocgVy1eIXNPIkzwFo1vz6wAEhtGrNOTNBWAoj"))
+            .expect("valid identity key");
+        let b = IdentityKey::decode(&decode("BcBSW4zuZfpaoAekU3rI4fuOcxvFAT+mWxI2V93zjctM"))
+            .expect("valid identity key");
+
+        const EXPECTED: &str =
+            "03629 84610 48359 95354 16784 69458 58902 57435 92969 05337 94466 27238";
+
+        assert_eq!(Fingerprint::compute(&a, &b).digits(), EXPECTED);
+        // Symmetric in practice, not just in principle.
+        assert_eq!(Fingerprint::compute(&b, &a).digits(), EXPECTED);
+    }
+
     #[test]
     fn forgetting_a_verification_returns_the_peer_to_tofu() {
         let store = InMemoryTrustStore::new();

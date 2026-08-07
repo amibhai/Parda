@@ -29,5 +29,13 @@ jni = "0.21"
 # parda-protocol — not a new dependency category for this workspace.
 zeroize = { workspace = true }
 
+[target.'cfg(target_os = "android")'.dependencies]
+# Route this crate's `tracing` output to logcat. Without this the
+# subscriber writes to stdout, which Android discards — so every mesh
+# warning and error was invisible on device, which is precisely why a
+# missing advertise call and a JNI class-loader failure both went
+# unnoticed until `dumpsys`/`logcat` were inspected directly.
+tracing-android = "0.2"
+
 [dev-dependencies]
 tokio-test = "0.4"

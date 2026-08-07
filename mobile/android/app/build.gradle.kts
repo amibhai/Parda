@@ -75,6 +75,13 @@ dependencies {
     // Required by isCoreLibraryDesugaringEnabled above.
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
 
+    // PersistentSignalStore: EncryptedSharedPreferences, whose master key
+    // lives in the Android Keystore. See that class's docs for precisely
+    // what this protects and what it does not (the Curve25519 private key
+    // itself cannot live inside the Keystore — Android exposes no X25519
+    // primitive libsignal's ratchet could use).
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
     // Sub-Phase 4.5C: PlaintextForensicRecoveryTest.kt, an on-device
     // (androidTest) instrumented test — needs a real device/emulator
     // process to read its own /proc/self/mem, which a local (JVM-only)
