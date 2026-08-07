@@ -34,6 +34,7 @@
 //! prototype per the brief, is message send/receive over genuine HTTP
 //! via `DirectTransport`.
 
+mod peer;
 mod stub_relay;
 
 use std::time::Duration;
@@ -72,6 +73,21 @@ enum Command {
         #[arg(long)]
         read_once: bool,
     },
+
+    /// Act as a live conversation partner against a running relay, so a
+    /// separate client (e.g. the Android app) has a real second party to
+    /// talk to. See `peer` module docs.
+    Peer {
+        /// Base URL of the running parda-relay.
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        relay_url: String,
+        /// The user ID this peer registers as.
+        #[arg(long, default_value = "bob")]
+        user_id: String,
+        /// Automatically reply to every message received.
+        #[arg(long)]
+        echo: bool,
+    },
 }
 
 #[tokio::main]
@@ -86,6 +102,9 @@ async fn main() {
                 std::process::exit(2);
             }
             run_demo(relay_url, expire_secs, read_once).await;
+        }
+        Command::Peer { relay_url, user_id, echo } => {
+            peer::run(relay_url, user_id, echo).await;
         }
     }
 }
