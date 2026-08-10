@@ -135,6 +135,113 @@ numbers. The vector is a real capture — two identity keys published to a
 live relay, and the digits the Android UI actually displayed. Rust and
 Kotlin matched exactly; the test pins it.
 
+### Added — In-person key exchange, durable history, and enforced verification (Android)
+
+Turns the Android client from something that demonstrates the protocol
+into something two people can actually use, and closes the first-contact
+MITM gap for anyone willing to stand next to each other. Verified end to
+end on a Pixel 8 (Android 17).
+
+#### Physical key exchange (QR contact cards)
+
+- `ContactCard` (`mobile/lib/models/contact_card.dart`) — the user ID,
+  public keys and a relay hint, as compact JSON sized to fit a QR code
+  (464 bytes in practice). Parsing is fail-closed: an unknown format
+  version or any field a `PreKeyBundle` needs is rejected outright, and
+  a payload that is not a PARDA card is ignored quietly, because a camera
+  pointed at the world finds plenty of other QR codes.
+- `MyCodeScreen` / `ScanScreen` — show a card, scan a peer's. Importing
+  one builds the session from the scanned keys directly and records the
+  peer as **verified**. **This is the security-relevant part, not a
+  convenience:** `/v1/keys/{id}` is trust-on-first-use and a compromised
+  relay can substitute a key, which is exactly the undefended
+  first-contact MITM `docs/phase4.5d-trust-bootstrapping-design.md` §4
+  records. A scanned card never passes through the relay.
+- Adding by user ID remains available, one level down in the sheet, with
+  the difference stated at the point of choice rather than the two being
+  presented as equivalent.
+- `parda-cli peer --import-card` — the same import path in an
+  independent implementation, which is how the app's cards were verified
+  as genuinely consumable rather than merely well-formed.
+
+#### Verification, now enforced rather than advisory
+
+- `PersistentSignalStore` records the identity key confirmed for a peer,
+  separately from libsignal's own pin-on-first-use entry (which a
+  conversation burn clears). `identityMatchesVerified` gates both
+  `processPreKeyBundle` and `importContact`, so a relay offering a
+  different key for a verified contact is refused with a message naming
+  them, not silently re-pinned.
+- The safety-number screen gained the action that makes comparing it
+  worth doing, and no longer disclaims enforcement it now has. Burning a
+  conversation deliberately keeps the verification: discarding a thread
+  is not a reason to un-decide that you met someone.
+- Removing a verification is explicit, for the genuine-reinstall case.
+
+#### Durable, encrypted conversation history
+
+- `MessageStore.kt` — one entry per message in
+  `EncryptedSharedPreferences` under an Android Keystore master key,
+  capped at 500 per conversation, deleted on burn or identity wipe.
+- **The trade is real and is documented, not implied away.** Sub-Phase
+  4.5C's position was that decrypted plaintext should never be written
+  down. It now is, encrypted at rest. Without it the app was not a
+  messenger: closing it lost everything. History can be switched off,
+  which deletes what is stored and restores the old behaviour along with
+  its old problems.
+
+#### Bugs found by running it
+
+- **Received messages were lost unless a chat bubble happened to render
+  them.** Persistence was hooked to the render path, but plaintext
+  handles are released when the app is backgrounded and most messages
+  arrive while the user is looking elsewhere — so the handle was gone
+  before anything read it and the message was unrecoverable despite
+  history being on. Observed on device: a message that arrived two
+  minutes before the chat was opened displayed as "Message no longer
+  available". Plaintext is now read at receipt. Covered by
+  `test/session_service_test.dart`.
+- **A message that failed to decrypt vanished without trace.** The
+  relay's fetch is destructive, so it was gone from the server too, and
+  nothing surfaced the failure — the user simply believed nobody had
+  written. Now a dismissible banner explains the likely cause. This is
+  how the stale-card behaviour below was found.
+- **One-time prekeys were never replenished.** After 100 sessions the
+  pool emptied permanently and every later bundle went out without one,
+  silently downgrading the first message's forward secrecy. Refills below
+  a low-water mark, continuing past the highest ID ever issued so a new
+  key cannot collide with one a peer still holds.
+- A card's one-time prekey is consumed by the first peer that uses it, so
+  a saved or screenshotted card yields a session the recipient cannot
+  decrypt. Codes are generated live per screen open, so this only affects
+  reusing a stored image — noted in the README rather than worked around.
+
+#### Release build
+
+- Real signing config from a gitignored `android/key.properties`, falling
+  back to the debug key with a loud warning when absent. Code shrinking
+  left off deliberately: most of this app's Kotlin surface is reached
+  only through JNI or libsignal's reflection, and wrong keep rules
+  produce a build that installs and then fails at runtime in ways
+  nothing here would catch.
+- `kotlin.incremental=false` — `mobile_scanner` ships its own Kotlin
+  Gradle Plugin, and in combination with Flutter's built-in Kotlin the
+  incremental compiler fails to close its caches on Windows, killing the
+  build before any real error can surface.
+
+#### Verified on device
+
+Card generated, decoded (464 bytes, all fields), imported by
+`parda-cli peer`, and a full bidirectional conversation completed over
+the resulting session with no relay key lookup. History survived a
+force-stop and relaunch with message text intact.
+
+**Not verified:** two phones exchanging cards by camera — there is one
+device here, so the scanner UI itself has been exercised only against
+the card format, not against another handset's screen. And the app only
+receives while foregrounded: polling is a Dart timer Android suspends
+with the app, and there is no background service or push.
+
 ### Added — Sub-Phases 4.5B-4.5E (Mobile Native Bridges, Trust Bootstrapping, Operational Hardening)
 
 Completes Phase 4.5. Unlike Phases 3 and 4, this phase resolved more than it opened — but three of its five sub-phases still ship narrower than their goal, and each boundary is stated rather than rounded up. Two new workspace crates: `/mobile-bridge` and `/tls`.
