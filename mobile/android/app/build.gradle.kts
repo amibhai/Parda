@@ -1,8 +1,35 @@
+import java.util.Properties
+import java.io.FileInputStream
+
 plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
 }
+
+// Release signing.
+//
+// Credentials live in `android/key.properties`, which is gitignored — a
+// keystore or its passwords in version control would let anyone publish
+// an update that Android accepts as this app. When the file is absent
+// (every fresh clone, and CI) the release build falls back to the debug
+// key and says so, rather than failing: an unsigned-for-distribution
+// build is still useful for testing, and a silent fallback would be
+// worse than a loud one.
+//
+// To produce a real release build:
+//   keytool -genkey -v -keystore parda-release.jks -keyalg RSA -keysize 4096 -validity 10000 -alias parda
+//   cat > android/key.properties <<EOF
+//   storeFile=/absolute/path/to/parda-release.jks
+//   storePassword=...
+//   keyAlias=parda
+//   keyPassword=...
+//   EOF
+val keystoreProperties = Properties().apply {
+    val f = rootProject.file("key.properties")
+    if (f.exists()) load(FileInputStream(f))
+}
+val hasReleaseKeystore = keystoreProperties.getProperty("storeFile") != null
 
 android {
     namespace = "com.parda.app"
@@ -34,11 +61,41 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        if (hasReleaseKeystore) {
+            create("release") {
+                storeFile = file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (hasReleaseKeystore) {
+                signingConfigs.getByName("release")
+            } else {
+                logger.warn(
+                    "PARDA: android/key.properties not found — signing the release build with " +
+                        "the DEBUG key. Fine for testing; never distribute this artifact."
+                )
+                signingConfigs.getByName("debug")
+            }
+
+            // Code shrinking is deliberately off.
+            //
+            // R8 strips classes it cannot see referenced, and most of
+            // this app's Kotlin surface is reached only through JNI
+            // (`MeshBridge`, `PlaintextBridge`) or reflection inside
+            // libsignal. Getting the keep rules wrong produces a build
+            // that installs and then fails at runtime in ways no test
+            // here would catch. Turning it on needs a device pass that
+            // has not been done, so it stays off rather than shipping an
+            // untested optimisation.
+            isMinifyEnabled = false
+            isShrinkResources = false
         }
     }
 }

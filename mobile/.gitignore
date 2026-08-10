@@ -43,3 +43,9 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Release signing credentials — a keystore or its passwords in version
+# control would let anyone ship an update Android accepts as this app.
+key.properties
+*.jks
+*.keystore
