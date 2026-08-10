@@ -45,10 +45,14 @@ class SignalPlugin : FlutterPlugin, MethodCallHandler {
     private lateinit var context: Context
 
     private var protocolStore: PersistentSignalStore? = null
+    private var messageStore: MessageStore? = null
 
     companion object {
         const val CHANNEL = "com.parda.app/signal"
         const val PREKEY_POOL_SIZE = 100
+
+        /// Refill once fewer than this many one-time prekeys remain.
+        const val PREKEY_LOW_WATER_MARK = 20
 
         /**
          * Domain-separation label for the mobile safety number. Must stay
@@ -73,6 +77,14 @@ class SignalPlugin : FlutterPlugin, MethodCallHandler {
             android.util.Log.e(CHANNEL, "failed to load persisted identity", e)
             null
         }
+        messageStore = try {
+            MessageStore.open(context)
+        } catch (e: Exception) {
+            // History is a convenience, not a correctness requirement —
+            // losing it must not stop the app from starting.
+            android.util.Log.e(CHANNEL, "failed to open message history", e)
+            null
+        }
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
@@ -90,11 +102,35 @@ class SignalPlugin : FlutterPlugin, MethodCallHandler {
                 "encryptMessage" -> handleEncryptMessage(call, result)
                 "decryptMessage" -> handleDecryptMessage(call, result)
                 "hasSession" -> handleHasSession(call, result)
-                "knownPeers" -> result.success(protocolStore?.knownPeers() ?: emptyList<String>())
+                "knownPeers" -> handleKnownPeers(result)
                 "safetyNumber" -> handleSafetyNumber(call, result)
                 "burnConversation" -> handleBurnConversation(call, result)
+                // ── Physical (QR) key exchange ──────────────────────
+                "contactCard" -> handleContactCard(result)
+                "importContact" -> handleImportContact(call, result)
+                "isVerified" -> result.success(
+                    protocolStore?.isVerified(call.argument<String>("remoteUserId")!!) ?: false
+                )
+                "markVerified" -> handleMarkVerified(call, result)
+                "forgetVerification" -> {
+                    protocolStore?.forgetVerification(call.argument<String>("remoteUserId")!!)
+                    result.success(null)
+                }
+                // ── Encrypted local history ─────────────────────────
+                "historyEnabled" -> result.success(messageStore?.isEnabled() ?: false)
+                "setHistoryEnabled" -> {
+                    messageStore?.setEnabled(call.argument<Boolean>("enabled") ?: true)
+                    result.success(null)
+                }
+                "loadHistory" -> handleLoadHistory(call, result)
+                "appendHistory" -> handleAppendHistory(call, result)
+                "conversations" -> result.success(messageStore?.conversations() ?: emptyList<String>())
                 "wipeIdentity" -> {
                     PersistentSignalStore.wipe(context)
+                    // History outlives the identity otherwise, leaving
+                    // readable plaintext behind after the user asked for
+                    // everything to be erased.
+                    messageStore?.clearAll()
                     protocolStore = null
                     result.success(null)
                 }
@@ -172,6 +208,7 @@ class SignalPlugin : FlutterPlugin, MethodCallHandler {
         // where the key comes from `Curve.generateKeyPair()`).
         val identityKey: IdentityKey = store.identityKeyPair.publicKey
         val signedPreKey = store.loadSignedPreKey(1)
+        replenishPreKeysIfLow(store)
         val availablePreKeyId = store.availablePreKeyIds().firstOrNull()
         val oneTimePreKey = availablePreKeyId?.let { store.loadPreKey(it) }
 
@@ -187,6 +224,31 @@ class SignalPlugin : FlutterPlugin, MethodCallHandler {
         )
     }
 
+    /**
+     * Top the one-time prekey pool back up when it runs low.
+     *
+     * Each incoming PreKey message consumes one, and nothing replaced
+     * them: after 100 new sessions the pool emptied permanently and every
+     * subsequent bundle went out without a one-time prekey. X3DH still
+     * completes in that case, but with the reduced forward secrecy
+     * libsignal documents for the first message — a silent, permanent
+     * downgrade that would never have announced itself.
+     *
+     * New IDs continue past the highest ever issued rather than refilling
+     * from 1, so a replenished key can never collide with one a peer is
+     * still holding from an older bundle.
+     */
+    private fun replenishPreKeysIfLow(store: PersistentSignalStore) {
+        val available = store.availablePreKeyIds()
+        if (available.size >= PREKEY_LOW_WATER_MARK) return
+
+        val nextId = (available.maxOrNull() ?: 0) + 1
+        for (id in nextId until nextId + PREKEY_POOL_SIZE) {
+            store.storePreKey(id, PreKeyRecord(id, Curve.generateKeyPair()))
+        }
+        android.util.Log.i(CHANNEL, "replenished one-time prekeys from id $nextId")
+    }
+
     // ── processPreKeyBundle ───────────────────────────────────────────────────
 
     private fun handleProcessPreKeyBundle(call: MethodCall, result: Result) {
@@ -196,6 +258,23 @@ class SignalPlugin : FlutterPlugin, MethodCallHandler {
 
         val remoteAddress = SignalProtocolAddress(remoteUserId, 1)
         val identityKey = IdentityKey(d64(bundleMap["identity_key"] as String), 0)
+
+        // Sub-Phase 4.5D, enforced. A bundle fetched from the relay is
+        // whatever the relay chose to hand over; if the user has met this
+        // peer and confirmed their key, a bundle carrying a *different*
+        // key is refused outright rather than re-pinned. Without this
+        // check the verification recorded by a QR scan would be
+        // decorative — the relay could still substitute a key at the next
+        // session rebuild.
+        if (!store.identityMatchesVerified(remoteUserId, identityKey)) {
+            return result.error(
+                "IDENTITY_CHANGED",
+                "The relay offered a different identity key for \"$remoteUserId\" than the one " +
+                    "you verified in person. Refusing to start a session.",
+                null
+            )
+        }
+
         val signedPreKeyId = (bundleMap["signed_prekey_id"] as Number).toInt()
         val signedPreKeyPub = Curve.decodePoint(d64(bundleMap["signed_prekey_public"] as String), 0)
         val signature = d64(bundleMap["signed_prekey_signature"] as String)
@@ -302,6 +381,159 @@ class SignalPlugin : FlutterPlugin, MethodCallHandler {
         result.success(store.containsSession(SignalProtocolAddress(remoteUserId, 1)))
     }
 
+    // ── Physical key exchange (QR contact cards) ──────────────────────────────
+
+    /**
+     * This device's contact card: everything a peer needs to open a
+     * session, with no relay involved.
+     *
+     * ## Why this matters more than convenience
+     *
+     * Fetching a bundle from `/v1/keys/{id}` is trust-on-first-use — the
+     * relay hands over whatever key it holds, and a malicious or
+     * compromised relay can substitute its own. That is exactly the
+     * first-contact MITM `docs/phase4.5d-trust-bootstrapping-design.md`
+     * §4 documents as undefended, and no amount of comparing safety
+     * numbers *afterwards* helps if nobody compares them.
+     *
+     * A card scanned off another person's screen never passes through
+     * the relay, so the relay is removed from the key-exchange path
+     * entirely. [importContact] therefore records the scanned identity
+     * as **verified**, and a later key change for that peer becomes a
+     * hard failure rather than a silent re-pin.
+     */
+    private fun handleContactCard(result: Result) {
+        val store = requireStore(result) ?: return
+        val bundle = buildBundleMap(store).toMutableMap()
+        bundle["v"] = 1
+        bundle["user_id"] = store.localUserId
+        result.success(bundle)
+    }
+
+    /**
+     * Establish a session from a scanned contact card and mark the peer
+     * verified.
+     *
+     * Refuses when the card's identity key contradicts one already
+     * verified for that user ID: that is either an attack or the peer
+     * genuinely reinstalling, and the two are indistinguishable from
+     * here — so it fails loud and lets the user decide, rather than
+     * silently replacing a key they once confirmed in person.
+     */
+    private fun handleImportContact(call: MethodCall, result: Result) {
+        val store = requireStore(result) ?: return
+        val card = call.argument<Map<String, Any>>("card")
+            ?: return result.error("BAD_ARGS", "card is required", null)
+
+        val userId = card["user_id"] as? String
+            ?: return result.error("BAD_CARD", "contact card has no user_id", null)
+        if (userId == store.localUserId) {
+            return result.error("SELF_CARD", "that is this device's own contact card", null)
+        }
+
+        val identityKey = IdentityKey(d64(card["identity_key"] as String), 0)
+
+        if (!store.identityMatchesVerified(userId, identityKey)) {
+            return result.error(
+                "IDENTITY_CHANGED",
+                "The key on this card does not match the one you previously verified for " +
+                    "\"$userId\". If they reinstalled, remove the old verification first; " +
+                    "otherwise treat this as an impersonation attempt.",
+                null
+            )
+        }
+
+        val address = SignalProtocolAddress(userId, 1)
+        val signedPreKeyId = (card["signed_prekey_id"] as Number).toInt()
+        val signedPreKeyPub = Curve.decodePoint(d64(card["signed_prekey_public"] as String), 0)
+        val signature = d64(card["signed_prekey_signature"] as String)
+        val oneTimePreKeyId = (card["one_time_prekey_id"] as? Number)?.toInt()
+        val oneTimePreKeyPub = (card["one_time_prekey_public"] as? String)
+            ?.let { Curve.decodePoint(d64(it), 0) }
+
+        val preKeyBundle = PreKeyBundle(
+            (card["registration_id"] as Number).toInt(),
+            1,
+            oneTimePreKeyId ?: 0,
+            oneTimePreKeyPub,
+            signedPreKeyId,
+            signedPreKeyPub,
+            signature,
+            identityKey
+        )
+
+        // `SessionBuilder.process` verifies the signed prekey's signature
+        // against the identity key on the card, so a card whose parts do
+        // not belong together is rejected here rather than producing a
+        // session that fails later in a confusing way.
+        SessionBuilder(store, address).process(preKeyBundle)
+        store.recordVerified(userId, identityKey)
+
+        result.success(mapOf("user_id" to userId))
+    }
+
+    /**
+     * Record the peer's *current* identity key as verified, after the
+     * user compared safety numbers by hand.
+     *
+     * Reads the key from the session store rather than taking one as an
+     * argument: the number the user just compared was computed from that
+     * key, so anything else would confirm something they never saw.
+     */
+    private fun handleMarkVerified(call: MethodCall, result: Result) {
+        val store = requireStore(result) ?: return
+        val remoteUserId = call.argument<String>("remoteUserId")!!
+        val identity = store.getIdentity(SignalProtocolAddress(remoteUserId, 1))
+            ?: return result.error(
+                "NO_IDENTITY",
+                "No identity key on file for $remoteUserId — exchange a message first",
+                null
+            )
+        store.recordVerified(remoteUserId, identity)
+        result.success(null)
+    }
+
+    // ── History ───────────────────────────────────────────────────────────────
+
+    /**
+     * Peers to show in the conversation list: those with a live session,
+     * plus any with stored history. The two can differ — a burned
+     * conversation drops the session, and history predates a session
+     * rebuild after a reinstall.
+     */
+    private fun handleKnownPeers(result: Result) {
+        val fromSessions = protocolStore?.knownPeers() ?: emptyList()
+        val fromHistory = messageStore?.conversations() ?: emptyList()
+        result.success((fromSessions + fromHistory).distinct().sorted())
+    }
+
+    private fun handleLoadHistory(call: MethodCall, result: Result) {
+        val peer = call.argument<String>("peer")!!
+        val entries = messageStore?.history(peer) ?: emptyList()
+        result.success(entries.map { json ->
+            mapOf(
+                "id" to json.optString("id"),
+                "peer" to json.optString("peer"),
+                "senderId" to json.optString("senderId"),
+                "body" to json.optString("body"),
+                "ts" to json.optLong("ts"),
+                "outgoing" to json.optBoolean("outgoing"),
+            )
+        })
+    }
+
+    private fun handleAppendHistory(call: MethodCall, result: Result) {
+        messageStore?.append(
+            id = call.argument<String>("id")!!,
+            peer = call.argument<String>("peer")!!,
+            senderId = call.argument<String>("senderId")!!,
+            body = call.argument<String>("body")!!,
+            timestampMs = (call.argument<Number>("ts") ?: 0).toLong(),
+            outgoing = call.argument<Boolean>("outgoing") ?: false,
+        )
+        result.success(null)
+    }
+
     // ── safetyNumber (Sub-Phase 4.5D) ─────────────────────────────────────────
 
     /**
@@ -388,10 +620,19 @@ class SignalPlugin : FlutterPlugin, MethodCallHandler {
 
     // ── burnConversation ──────────────────────────────────────────────────────
 
+    /**
+     * Burning drops the session and this conversation's stored history.
+     *
+     * It deliberately leaves any out-of-band *verification* in place: the
+     * user met this person and confirmed their key, and discarding a
+     * conversation is not a reason to un-decide that. Keeping it means a
+     * rebuilt session still refuses a substituted key.
+     */
     private fun handleBurnConversation(call: MethodCall, result: Result) {
         val store = requireStore(result) ?: return
         val remoteUserId = call.argument<String>("remoteUserId")!!
         store.burnConversation(remoteUserId)
+        messageStore?.deleteConversation(remoteUserId)
         result.success(null)
     }
 

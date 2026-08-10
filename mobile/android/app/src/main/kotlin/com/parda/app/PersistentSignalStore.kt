@@ -69,6 +69,16 @@ class PersistentSignalStore private constructor(
         private const val PREFIX_SESSION = "session_"
         private const val PREFIX_TRUSTED_IDENTITY = "identity_"
 
+        /// The identity key a user confirmed out-of-band for a peer.
+        /// Distinct from [PREFIX_TRUSTED_IDENTITY], which is libsignal's
+        /// own pin-on-first-use record — that one is overwritten
+        /// whenever a new key arrives, and is cleared by a conversation
+        /// burn. This one changes only when a human says so, which is
+        /// what makes it usable as evidence that a later key change is
+        /// an attack rather than a reinstall. Mirrors
+        /// `parda_protocol::trust::TrustStore` (Sub-Phase 4.5D).
+        private const val PREFIX_VERIFIED_IDENTITY = "verified_"
+
         private fun openPrefs(context: Context): SharedPreferences {
             val masterKey = MasterKey.Builder(context)
                 .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
@@ -269,6 +279,59 @@ class PersistentSignalStore private constructor(
             .filter { it.startsWith("$PREFIX_TRUSTED_IDENTITY$name::") }
             .forEach { editor.remove(it) }
         editor.apply()
+    }
+
+    // ── Out-of-band verification (Sub-Phase 4.5D, enforced) ─────────────
+
+    /**
+     * Record that the user confirmed `identityKey` for `name`
+     * out-of-band — by scanning their QR contact card in person, or by
+     * comparing safety numbers.
+     */
+    fun recordVerified(name: String, identityKey: IdentityKey) {
+        prefs.edit()
+            .putString("$PREFIX_VERIFIED_IDENTITY$name", encode(identityKey.serialize()))
+            .apply()
+    }
+
+    /** The identity key verified out-of-band for `name`, if any. */
+    fun verifiedIdentity(name: String): IdentityKey? {
+        val blob = prefs.getString("$PREFIX_VERIFIED_IDENTITY$name", null) ?: return null
+        return try {
+            IdentityKey(decode(blob), 0)
+        } catch (e: Exception) {
+            android.util.Log.w("PersistentSignalStore", "unreadable verified identity for $name", e)
+            null
+        }
+    }
+
+    fun isVerified(name: String): Boolean =
+        prefs.contains("$PREFIX_VERIFIED_IDENTITY$name")
+
+    /**
+     * Forget a verification, returning the peer to trust-on-first-use.
+     *
+     * Needed for the legitimate case of a peer who really did reinstall.
+     * Deliberately explicit: nothing in this class clears a verification
+     * on its own, and in particular [burnConversation] does not — a burn
+     * is about discarding conversation state, not about un-deciding that
+     * you met someone in person.
+     */
+    fun forgetVerification(name: String) {
+        prefs.edit().remove("$PREFIX_VERIFIED_IDENTITY$name").apply()
+    }
+
+    /**
+     * Check `candidate` against any out-of-band verification on file.
+     *
+     * `true` means "safe to proceed": either no verification exists (the
+     * unchanged trust-on-first-use path), or the key matches the one
+     * that was verified. `false` means a verified peer's identity key
+     * has changed — the caller must refuse, not re-pin.
+     */
+    fun identityMatchesVerified(name: String, candidate: IdentityKey): Boolean {
+        val verified = verifiedIdentity(name) ?: return true
+        return verified == candidate
     }
 
     /** Every peer this device currently holds a session with. */

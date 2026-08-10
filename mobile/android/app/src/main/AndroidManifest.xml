@@ -10,6 +10,11 @@
          not assumed from the manifest alone. `neverForLocation` is
          accurate here: this app never derives physical location from BLE
          scan results, only the opaque AdvertToken payload. -->
+    <!-- Scanning a peer's QR contact card (mobile_scanner). Requested at
+         runtime by the scanner itself; the scan screen explains the
+         failure and points at Android settings if it is denied. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
