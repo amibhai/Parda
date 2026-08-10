@@ -87,6 +87,11 @@ enum Command {
         /// Automatically reply to every message received.
         #[arg(long)]
         echo: bool,
+        /// Path to a JSON contact card (the payload encoded in the app's
+        /// QR code). Builds the session from those keys directly rather
+        /// than fetching them from the relay.
+        #[arg(long)]
+        import_card: Option<String>,
     },
 }
 
@@ -103,8 +108,8 @@ async fn main() {
             }
             run_demo(relay_url, expire_secs, read_once).await;
         }
-        Command::Peer { relay_url, user_id, echo } => {
-            peer::run(relay_url, user_id, echo).await;
+        Command::Peer { relay_url, user_id, echo, import_card } => {
+            peer::run(relay_url, user_id, echo, import_card).await;
         }
     }
 }

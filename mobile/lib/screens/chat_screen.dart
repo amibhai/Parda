@@ -23,6 +23,22 @@ class _ChatScreenState extends State<ChatScreen> {
   final _scrollController = ScrollController();
   bool _sending = false;
   int _lastMessageCount = 0;
+  bool _verified = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshVerified();
+  }
+
+  /// Whether this peer's key was confirmed in person. Shown in the
+  /// header because it is the difference between "encrypted to whoever
+  /// the relay said this is" and "encrypted to the person you met".
+  Future<void> _refreshVerified() async {
+    final verified =
+        await context.read<SessionService>().isVerified(widget.remoteUserId);
+    if (mounted) setState(() => _verified = verified);
+  }
 
   @override
   void dispose() {
@@ -75,12 +91,18 @@ class _ChatScreenState extends State<ChatScreen> {
             const SizedBox(height: 2),
             Row(
               children: [
-                const Icon(Icons.lock, size: 11, color: AppColors.secure),
+                Icon(
+                  _verified ? Icons.verified_user : Icons.lock,
+                  size: 11,
+                  color: _verified ? AppColors.secure : AppColors.textMuted,
+                ),
                 const SizedBox(width: 4),
                 Text(
-                  'End-to-end encrypted',
+                  _verified ? 'Verified in person' : 'Encrypted, not verified',
                   style: TextStyle(
-                    color: AppColors.secure.withValues(alpha: 0.9),
+                    color: _verified
+                        ? AppColors.secure.withValues(alpha: 0.9)
+                        : AppColors.textMuted,
                     fontSize: 11,
                   ),
                 ),
@@ -92,11 +114,14 @@ class _ChatScreenState extends State<ChatScreen> {
           IconButton(
             icon: const Icon(Icons.verified_user_outlined, size: 21),
             tooltip: 'Verify safety number',
-            onPressed: () => Navigator.of(context).push(
-              MaterialPageRoute(
-                builder: (_) => SafetyNumberScreen(remoteUserId: widget.remoteUserId),
-              ),
-            ),
+            onPressed: () async {
+              await Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => SafetyNumberScreen(remoteUserId: widget.remoteUserId),
+                ),
+              );
+              await _refreshVerified();
+            },
           ),
           PopupMenuButton<String>(
             color: AppColors.surfaceHigh,
@@ -364,6 +389,10 @@ class _ChatBubbleState extends State<_ChatBubble> {
   }
 
   Future<void> _load() async {
+    // Already-rendered text wins: a handle may since have been released
+    // (they all are when the app is backgrounded), and re-reading one
+    // that is gone would turn a perfectly good message into "no longer
+    // available" purely because the bubble was rebuilt.
     if (widget.message.body != null) {
       _renderedBody = widget.message.body;
       return;
@@ -375,10 +404,16 @@ class _ChatBubbleState extends State<_ChatBubble> {
     }
     final body = await PlaintextHandle(handleId).renderCopy();
     if (!mounted) return;
+    if (body != null) {
+      // Hand it back so the message keeps its text and gets written to
+      // encrypted history -- otherwise every scroll would depend on a
+      // handle whose lifetime the UI does not control.
+      context
+          .read<SessionService>()
+          .cacheRenderedBody(widget.message.conversationId, widget.message.id, body);
+    }
     setState(() {
       _renderedBody = body;
-      // A released handle returns null. Saying so beats an ellipsis that
-      // never resolves.
       _unavailable = body == null;
     });
   }

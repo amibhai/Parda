@@ -126,4 +126,79 @@ class SignalBridge {
   Future<void> wipeIdentity() async {
     await _channel.invokeMethod<void>('wipeIdentity');
   }
+
+  // ── Physical (QR) key exchange ──────────────────────────────────────
+
+  /// This device's contact card, for display as a QR code.
+  Future<Map<String, dynamic>> contactCard() async {
+    final result = await _channel.invokeMethod<Map>('contactCard');
+    return Map<String, dynamic>.from(result!);
+  }
+
+  /// Establish a session from a scanned card and mark the peer verified.
+  ///
+  /// Throws [PlatformException] with code `IDENTITY_CHANGED` when the
+  /// card contradicts a key already verified for that user ID, and
+  /// `SELF_CARD` when scanning one's own card.
+  Future<String> importContact(Map<String, dynamic> card) async {
+    final result = await _channel.invokeMethod<Map>('importContact', {'card': card});
+    return Map<String, dynamic>.from(result!)['user_id'] as String;
+  }
+
+  /// `true` if this peer's key was confirmed out-of-band.
+  Future<bool> isVerified(String remoteUserId) async =>
+      await _channel.invokeMethod<bool>('isVerified', {
+        'remoteUserId': remoteUserId,
+      }) ??
+      false;
+
+  /// Record the peer's current identity key as verified — the manual
+  /// counterpart to importing a scanned contact card.
+  Future<void> markVerified(String remoteUserId) async {
+    await _channel.invokeMethod<void>('markVerified', {
+      'remoteUserId': remoteUserId,
+    });
+  }
+
+  /// Drop a verification, returning the peer to trust-on-first-use — the
+  /// escape hatch for a peer who genuinely reinstalled.
+  Future<void> forgetVerification(String remoteUserId) async {
+    await _channel.invokeMethod<void>('forgetVerification', {
+      'remoteUserId': remoteUserId,
+    });
+  }
+
+  // ── Encrypted local history ─────────────────────────────────────────
+
+  Future<bool> historyEnabled() async =>
+      await _channel.invokeMethod<bool>('historyEnabled') ?? false;
+
+  Future<void> setHistoryEnabled(bool enabled) async {
+    await _channel.invokeMethod<void>('setHistoryEnabled', {'enabled': enabled});
+  }
+
+  Future<List<Map<String, dynamic>>> loadHistory(String peer) async {
+    final result = await _channel.invokeMethod<List>('loadHistory', {'peer': peer});
+    return (result ?? const [])
+        .map((e) => Map<String, dynamic>.from(e as Map))
+        .toList();
+  }
+
+  Future<void> appendHistory({
+    required String id,
+    required String peer,
+    required String senderId,
+    required String body,
+    required int timestampMs,
+    required bool outgoing,
+  }) async {
+    await _channel.invokeMethod<void>('appendHistory', {
+      'id': id,
+      'peer': peer,
+      'senderId': senderId,
+      'body': body,
+      'ts': timestampMs,
+      'outgoing': outgoing,
+    });
+  }
 }

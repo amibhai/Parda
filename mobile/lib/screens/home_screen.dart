@@ -6,6 +6,8 @@ import '../models/message.dart';
 import '../services/session_service.dart';
 import '../theme/app_theme.dart';
 import 'chat_screen.dart';
+import 'my_code_screen.dart';
+import 'scan_screen.dart';
 import 'settings_screen.dart';
 
 /// Conversation list, plus the app's connectivity and mesh status.
@@ -47,6 +49,13 @@ class HomeScreen extends StatelessWidget {
         ),
         actions: [
           IconButton(
+            icon: const Icon(Icons.qr_code_2),
+            tooltip: 'My code',
+            onPressed: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const MyCodeScreen()),
+            ),
+          ),
+          IconButton(
             icon: const Icon(Icons.settings_outlined),
             tooltip: 'Settings',
             onPressed: () => Navigator.of(context).push(
@@ -59,7 +68,31 @@ class HomeScreen extends StatelessWidget {
           child: _StatusBar(session: session),
         ),
       ),
-      body: RefreshIndicator(
+      body: Column(
+        children: [
+          if (session.lastError != null) _ErrorBanner(session: session),
+          Expanded(child: _buildList(context, session, conversations)),
+        ],
+      ),
+      // Scanning is the primary action, not the typed-ID path: it is
+      // both easier and the only one that keeps the relay out of key
+      // exchange. Adding by ID remains available inside the sheet.
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => _showNewChatSheet(context),
+        backgroundColor: AppColors.secure,
+        foregroundColor: Colors.black,
+        icon: const Icon(Icons.qr_code_scanner),
+        label: const Text('Add contact', style: TextStyle(fontWeight: FontWeight.w700)),
+      ),
+    );
+  }
+
+  Widget _buildList(
+    BuildContext context,
+    SessionService session,
+    List<String> conversations,
+  ) {
+    return RefreshIndicator(
         color: AppColors.secure,
         backgroundColor: AppColors.surface,
         onRefresh: () async {
@@ -84,13 +117,42 @@ class HomeScreen extends StatelessWidget {
                   );
                 },
               ),
-      ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => _showNewChatSheet(context),
-        backgroundColor: AppColors.secure,
-        foregroundColor: Colors.black,
-        icon: const Icon(Icons.add_comment_outlined),
-        label: const Text('New chat', style: TextStyle(fontWeight: FontWeight.w700)),
+    );
+  }
+}
+
+/// Surfaces a receive failure. Without this a message that arrived and
+/// could not be decrypted disappeared entirely — the relay had already
+/// dropped it, so there was nothing left to notice.
+class _ErrorBanner extends StatelessWidget {
+  final SessionService session;
+  const _ErrorBanner({required this.session});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      color: AppColors.danger.withValues(alpha: 0.14),
+      padding: const EdgeInsets.fromLTRB(16, 10, 8, 10),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.warning_amber_outlined, color: AppColors.danger, size: 18),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              session.lastError!,
+              style: const TextStyle(
+                  color: AppColors.danger, fontSize: 12.5, height: 1.4),
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.close, size: 18, color: AppColors.danger),
+            visualDensity: VisualDensity.compact,
+            onPressed: session.clearError,
+            tooltip: 'Dismiss',
+          ),
+        ],
       ),
     );
   }
@@ -310,23 +372,67 @@ class _NewChatSheetState extends State<_NewChatSheet> {
           ),
           const SizedBox(height: 20),
           const Text(
-            'New secure chat',
+            'Add a contact',
             style: TextStyle(
               color: AppColors.textPrimary,
               fontSize: 18,
               fontWeight: FontWeight.w700,
             ),
           ),
-          const SizedBox(height: 6),
-          const Text(
-            'Enter the user ID of someone enrolled on the same relay. '
-            'Their published keys are fetched and a session established.',
-            style: TextStyle(color: AppColors.textSecondary, fontSize: 12.5, height: 1.45),
+          const SizedBox(height: 16),
+
+          // In-person exchange first, and visibly the recommended one —
+          // it is the only path that keeps the relay out of key
+          // exchange, so presenting the two as equivalent choices would
+          // misrepresent them.
+          _PrimaryOption(
+            icon: Icons.qr_code_scanner,
+            title: 'Scan their code',
+            subtitle: 'In person. Their key never touches the relay, and the '
+                'contact is marked verified.',
+            onTap: () {
+              Navigator.of(context).pop();
+              Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const ScanScreen()),
+              );
+            },
           ),
-          const SizedBox(height: 18),
+          const SizedBox(height: 10),
+          _PrimaryOption(
+            icon: Icons.qr_code_2,
+            title: 'Show my code',
+            subtitle: 'Let them scan you instead.',
+            onTap: () {
+              Navigator.of(context).pop();
+              Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const MyCodeScreen()),
+              );
+            },
+          ),
+
+          const SizedBox(height: 22),
+          const Row(
+            children: [
+              Expanded(child: Divider(color: AppColors.border)),
+              Padding(
+                padding: EdgeInsets.symmetric(horizontal: 12),
+                child: Text(
+                  'or add by user ID',
+                  style: TextStyle(color: AppColors.textMuted, fontSize: 11.5),
+                ),
+              ),
+              Expanded(child: Divider(color: AppColors.border)),
+            ],
+          ),
+          const SizedBox(height: 14),
+          const Text(
+            'Fetches their key from the relay, which you have to trust to '
+            'hand over the right one. Verify the safety number afterwards.',
+            style: TextStyle(color: AppColors.textMuted, fontSize: 12, height: 1.45),
+          ),
+          const SizedBox(height: 12),
           TextField(
             controller: _controller,
-            autofocus: true,
             autocorrect: false,
             enableSuggestions: false,
             textInputAction: TextInputAction.go,
@@ -402,5 +508,68 @@ class _NewChatSheetState extends State<_NewChatSheet> {
       return 'Could not reach the relay. Check Settings.';
     }
     return text;
+  }
+}
+
+/// A prominent, tappable option row used for the two in-person contact
+/// exchange paths.
+class _PrimaryOption extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final VoidCallback onTap;
+
+  const _PrimaryOption({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(14),
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: AppColors.surfaceHigh,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: AppColors.secure.withValues(alpha: 0.35)),
+        ),
+        child: Row(
+          children: [
+            Icon(icon, color: AppColors.secure, size: 24),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(
+                      color: AppColors.textPrimary,
+                      fontSize: 15,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    subtitle,
+                    style: const TextStyle(
+                      color: AppColors.textMuted,
+                      fontSize: 12,
+                      height: 1.4,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const Icon(Icons.chevron_right, color: AppColors.textMuted, size: 20),
+          ],
+        ),
+      ),
+    );
   }
 }

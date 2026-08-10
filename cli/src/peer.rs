@@ -32,7 +32,7 @@
 
 use std::time::Duration;
 
-use libsignal_protocol::{IdentityKeyPair, PreKeyBundle, ProtocolAddress};
+use libsignal_protocol::{PreKeyBundle, ProtocolAddress};
 use parda_protocol::{
     envelope::MessageEnvelope,
     identity::LocalIdentity,
@@ -53,7 +53,12 @@ fn d64(s: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("bad base64: {e}"))
 }
 
-pub async fn run(relay_url: String, user_id: String, echo: bool) {
+pub async fn run(
+    relay_url: String,
+    user_id: String,
+    echo: bool,
+    import_card: Option<String>,
+) {
     let relay_url = relay_url.trim_end_matches('/').to_string();
     let http = reqwest::Client::new();
 
@@ -91,6 +96,63 @@ pub async fn run(relay_url: String, user_id: String, echo: bool) {
         Err(e) => {
             eprintln!("could not reach relay at {relay_url}: {e}");
             std::process::exit(1);
+        }
+    }
+
+    // ── Optional: import a scanned contact card ──────────────────────
+    //
+    // Proves the *physical* key-exchange path against an independent
+    // implementation: the card comes from the Android app's QR code, and
+    // the session below is built entirely from it. Nothing is fetched
+    // from `/v1/keys`, so a relay that wanted to substitute a key never
+    // gets the chance.
+    if let Some(path) = import_card {
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) => {
+                eprintln!("could not read contact card {path}: {e}");
+                std::process::exit(1);
+            }
+        };
+        let value: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("contact card {path} is not valid JSON: {e}");
+                std::process::exit(1);
+            }
+        };
+        let peer_id = value
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if peer_id.is_empty() {
+            eprintln!("contact card has no user_id");
+            std::process::exit(1);
+        }
+        match bundle_from_json(&value) {
+            Ok(bundle) => {
+                let address = ProtocolAddress::new(peer_id.clone(), 1.into());
+                match manager.initiate_session(&address, &bundle).await {
+                    Ok(()) => println!(
+                        "imported contact card for \"{peer_id}\" — session established from \
+                         scanned keys, no relay lookup"
+                    ),
+                    Err(e) => {
+                        eprintln!("could not establish a session from the card: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                let greeting = format!("hello {peer_id}, this session came from your QR code");
+                match send_reply(&http, &relay_url, &mut manager, &peer_id, &greeting).await {
+                    Ok(()) => println!("sent an opening message to \"{peer_id}\""),
+                    Err(e) => eprintln!("could not send the opening message: {e}"),
+                }
+            }
+            Err(e) => {
+                eprintln!("contact card is malformed: {e}");
+                std::process::exit(1);
+            }
         }
     }
 
@@ -193,10 +255,9 @@ fn bundle_to_json(identity: &LocalIdentity) -> serde_json::Value {
 }
 
 /// Parse a relay `PreKeyBundleJson` back into a libsignal [`PreKeyBundle`].
-/// Unused by the peer loop itself (the app initiates), but kept beside
-/// [`bundle_to_json`] so both directions of the same wire shape live
-/// together and cannot drift apart unnoticed.
-#[allow(dead_code)]
+/// Used by `--import-card`, and kept beside [`bundle_to_json`] so both
+/// directions of the same wire shape live together and cannot drift
+/// apart unnoticed.
 pub fn bundle_from_json(v: &serde_json::Value) -> Result<PreKeyBundle, String> {
     use libsignal_protocol::{IdentityKey, PublicKey};
 
@@ -239,8 +300,3 @@ pub fn bundle_from_json(v: &serde_json::Value) -> Result<PreKeyBundle, String> {
     )
     .map_err(|e| e.to_string())
 }
-
-/// Kept so the module's own identity type is referenced even when the
-/// helper above is compiled out.
-#[allow(dead_code)]
-fn _assert_identity_type(_: &IdentityKeyPair) {}

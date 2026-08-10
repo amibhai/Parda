@@ -7,6 +7,7 @@ import '../config/app_config.dart';
 import '../crypto/mesh_bridge.dart';
 import '../crypto/plaintext_handle.dart';
 import '../crypto/signal_bridge.dart';
+import '../models/contact_card.dart';
 import '../models/message.dart';
 import 'api_service.dart';
 
@@ -15,18 +16,34 @@ enum RelayStatus { unknown, checking, online, offline }
 
 /// Manages the full session lifecycle for PARDA messaging.
 ///
-/// ## Sub-Phase 4.5C: native plaintext handle lifecycle
+/// ## Plaintext handling, and the durability trade it now makes
 ///
-/// A received message's decrypted content lives behind a native
-/// [PlaintextHandle], not a cached Dart `String` (see
-/// `models/message.dart`, `docs/phase4.5c-dart-plaintext-design.md`).
-/// Releasing a handle the moment its bubble scrolls off-screen was
-/// considered and rejected: this app keeps no persistent message
-/// history and the relay's fetch is destructive, so a released handle
-/// can never be repopulated — scrolling away and back would lose the
-/// message. Instead every outstanding handle is released when the app
-/// leaves the foreground, which still narrows the window from "as long
-/// as the process happens to live" to "until the app is backgrounded".
+/// A freshly-decrypted message arrives as a native [PlaintextHandle]
+/// rather than raw bytes (`docs/phase4.5c-dart-plaintext-design.md`),
+/// and every outstanding handle is released when the app leaves the
+/// foreground.
+///
+/// That alone did not survive contact with real use. Handles are gone
+/// after backgrounding and the relay's fetch is destructive, so a
+/// received message read as permanently unavailable and nothing
+/// survived a restart.
+///
+/// So the behaviour now forks on one setting:
+///
+/// - **History on** (the default): the plaintext is read out of the
+///   handle immediately on receipt, kept on the [Message], written to
+///   encrypted history (`MessageStore.kt`), and the handle released.
+///   Decrypted content is therefore stored at rest under an Android
+///   Keystore key, where it used to be memory-only — a real cost,
+///   documented on `MessageStore` and in the README.
+/// - **History off**: the handle-only path, unchanged. Nothing is
+///   written down, and a message not read before the app is
+///   backgrounded is genuinely gone.
+///
+/// Reading at receipt rather than at render is deliberate and was
+/// learned the hard way: most messages arrive while the user is looking
+/// elsewhere, so a render-time read found the handle already released
+/// and lost the message despite history being on.
 class SessionService extends ChangeNotifier with WidgetsBindingObserver {
   final SignalBridge _signal;
   final MeshBridge _mesh;
@@ -76,6 +93,75 @@ class SessionService extends ChangeNotifier with WidgetsBindingObserver {
   final List<PlaintextHandle> _livePlaintextHandles = [];
   Timer? _pollTimer;
 
+  bool _historyEnabled = true;
+  bool get historyEnabled => _historyEnabled;
+
+  /// Rehydrate every stored conversation.
+  ///
+  /// Without this the app forgot everything on restart, which is the
+  /// difference between a demo and a messenger. Stored messages carry
+  /// their text directly — they have no live native handle, and are not
+  /// re-decrypted (the ratchet step that produced them is long gone).
+  Future<void> _loadHistory() async {
+    if (!_historyEnabled) return;
+    final localUserId = _localUserId ?? '';
+    for (final peer in _peers.toList()) {
+      try {
+        final rows = await _signal.loadHistory(peer);
+        if (rows.isEmpty) continue;
+        _messages[peer] = rows
+            .map((row) => Message.fromHistory(row, localUserId))
+            .toList();
+      } catch (e) {
+        debugPrint('[SessionService] could not load history for $peer: $e');
+      }
+    }
+  }
+
+  Future<void> setHistoryEnabled(bool enabled) async {
+    await _signal.setHistoryEnabled(enabled);
+    _historyEnabled = enabled;
+    if (!enabled) {
+      // The native side has already deleted the stored copies; drop the
+      // in-memory mirror too so the UI matches what is actually retained.
+      _messages.clear();
+    }
+    notifyListeners();
+  }
+
+  /// Persist a message, best-effort.
+  ///
+  /// A failure here costs durability, never delivery — the message has
+  /// already been sent or received by the time this runs, so it must not
+  /// propagate.
+  Future<void> _persist(Message msg, String body) async {
+    if (!_historyEnabled) return;
+    try {
+      await _signal.appendHistory(
+        id: msg.id,
+        peer: msg.conversationId,
+        senderId: msg.senderId,
+        body: body,
+        timestampMs: msg.timestamp.millisecondsSinceEpoch,
+        outgoing: msg.isOutgoing,
+      );
+    } catch (e) {
+      debugPrint('[SessionService] could not persist message: $e');
+    }
+  }
+
+  /// Cache the text a bubble just read out of a native handle, so the
+  /// same message renders from memory next time instead of depending on
+  /// a handle that may since have been released.
+  void cacheRenderedBody(String conversationId, String messageId, String body) {
+    final convo = _messages[conversationId];
+    if (convo == null) return;
+    final idx = convo.indexWhere((m) => m.id == messageId);
+    if (idx == -1 || convo[idx].body != null) return;
+    convo[idx] = convo[idx].copyWith(body: body);
+    unawaited(_persist(convo[idx], body));
+  }
+
   SessionService({SignalBridge? signal, MeshBridge? mesh, ApiService? api})
       : _signal = signal ?? SignalBridge(),
         _mesh = mesh ?? MeshBridge(),
@@ -110,6 +196,8 @@ class SessionService extends ChangeNotifier with WidgetsBindingObserver {
       _localUserId = _enrolled ? await _signal.localUserId() : null;
       if (_enrolled) {
         _peers.addAll(await _signal.knownPeers());
+        _historyEnabled = await _signal.historyEnabled();
+        await _loadHistory();
         _startPolling();
         unawaited(refreshRelayStatus());
         if (AppConfig.meshEnabled) {
@@ -170,6 +258,10 @@ class SessionService extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   // ── Relay configuration ──────────────────────────────────────────────
+
+  /// The relay this device is currently configured to use. Exposed so
+  /// UI can compare it against a scanned card's relay hint.
+  String get relayBaseUrl => AppConfig.relayBaseUrl;
 
   Future<void> setRelayUrl(String url) async {
     await AppConfig.setRelayBaseUrl(url);
@@ -250,6 +342,54 @@ class SessionService extends ChangeNotifier with WidgetsBindingObserver {
   Future<String> safetyNumber(String remoteUserId) =>
       _signal.safetyNumber(remoteUserId);
 
+  /// This device's contact card, tagged with the relay it is using so a
+  /// scanner can adopt the same one.
+  Future<ContactCard> contactCard() async {
+    final raw = await _signal.contactCard();
+    return ContactCard(raw).withRelay(AppConfig.relayBaseUrl);
+  }
+
+  /// Import a scanned card: opens a session from keys that never touched
+  /// the relay, and records the peer as verified.
+  ///
+  /// Optionally adopts the relay the card advertises — without a shared
+  /// relay the two devices can verify each other perfectly and still
+  /// have nowhere to exchange messages, which is a confusing way to
+  /// fail.
+  Future<String> importContact(ContactCard card, {bool adoptRelay = false}) async {
+    if (adoptRelay && card.relayUrl != null && card.relayUrl!.isNotEmpty) {
+      await setRelayUrl(card.relayUrl!);
+    }
+    final peer = await _signal.importContact(card.raw);
+    _peers.add(peer);
+    notifyListeners();
+    // Publishing is what lets the *other* side reach this device through
+    // the relay. Best-effort: a failure here does not undo a verified
+    // session, and Settings offers a manual retry.
+    unawaited(_republishQuietly());
+    return peer;
+  }
+
+  Future<void> _republishQuietly() async {
+    try {
+      await republishBundle();
+    } catch (e) {
+      debugPrint('[SessionService] bundle re-publish after import failed: $e');
+    }
+  }
+
+  Future<bool> isVerified(String remoteUserId) => _signal.isVerified(remoteUserId);
+
+  Future<void> markVerified(String remoteUserId) async {
+    await _signal.markVerified(remoteUserId);
+    notifyListeners();
+  }
+
+  Future<void> forgetVerification(String remoteUserId) async {
+    await _signal.forgetVerification(remoteUserId);
+    notifyListeners();
+  }
+
   Future<void> burnConversation(String remoteUserId) async {
     await _signal.burnConversation(remoteUserId);
     for (final m in _messages[remoteUserId] ?? const <Message>[]) {
@@ -288,6 +428,7 @@ class SessionService extends ChangeNotifier with WidgetsBindingObserver {
       );
       await _api.submitMessage(remoteUserId, envelopeJson);
       _updateMessageStatus(localMsg.id, remoteUserId, MessageStatus.sent);
+      unawaited(_persist(localMsg, body));
     } catch (e) {
       _updateMessageStatus(localMsg.id, remoteUserId, MessageStatus.failed);
       rethrow;
@@ -352,25 +493,68 @@ class SessionService extends ChangeNotifier with WidgetsBindingObserver {
       }
 
       final handleId = await _signal.decryptMessage(envelope);
-      final handle = PlaintextHandle(handleId);
-      _livePlaintextHandles.add(handle);
+      final id = envelopeJson['id'] as String? ?? _localId();
+      final timestamp = DateTime.fromMillisecondsSinceEpoch(
+        (envelope['timestamp_ms'] as num?)?.toInt() ??
+            DateTime.now().millisecondsSinceEpoch,
+      );
+
+      // Read the plaintext *now* when history is on, rather than leaving
+      // it for whenever a bubble happens to render.
+      //
+      // Deferring it looked tidier and was wrong: handles are released
+      // when the app leaves the foreground, and most messages arrive
+      // while the user is not looking at that conversation. The handle
+      // was routinely gone before anything read it, so the message
+      // showed "no longer available" and was never written to history —
+      // permanently lost despite history being enabled. Observed on a
+      // Pixel 8 with a message that arrived two minutes before the chat
+      // was opened.
+      //
+      // With history off the handle-only path is kept: nothing is
+      // written down, and a message not read before the app is
+      // backgrounded is genuinely gone. That is the stricter posture the
+      // setting promises, and it is now the only place it applies.
+      String? body;
+      if (_historyEnabled) {
+        final handle = PlaintextHandle(handleId);
+        body = await handle.renderCopy();
+        // The text is safely in the Message and on its way to storage;
+        // holding the native buffer open past that point buys nothing.
+        await handle.release();
+      } else {
+        _livePlaintextHandles.add(PlaintextHandle(handleId));
+      }
 
       final msg = Message(
-        id: envelopeJson['id'] as String? ?? _localId(),
+        id: id,
         conversationId: senderId,
         senderId: senderId,
-        plaintextHandleId: handleId,
-        timestamp: DateTime.fromMillisecondsSinceEpoch(
-          (envelope['timestamp_ms'] as num?)?.toInt() ??
-              DateTime.now().millisecondsSinceEpoch,
-        ),
+        body: body,
+        plaintextHandleId: body == null ? handleId : null,
+        timestamp: timestamp,
         status: MessageStatus.received,
       );
 
       _peers.add(senderId);
       _addMessage(msg);
+      if (body != null) {
+        unawaited(_persist(msg, body));
+      }
     } catch (e) {
-      _lastError = 'Failed to decrypt an incoming message: $e';
+      // A message that arrives and cannot be decrypted used to vanish
+      // without trace: the relay's fetch is destructive, so it was gone
+      // from the server too, and nothing surfaced the failure. Silence
+      // is the worst possible response — the user is left believing
+      // nobody wrote to them.
+      //
+      // The usual cause is a session mismatch: the sender built their
+      // session from a stale copy of this device's keys (a screenshotted
+      // QR card whose one-time prekey has since been used, or a peer
+      // that re-enrolled). Say that, since it is actionable.
+      _lastError = 'A message arrived that could not be decrypted. The sender '
+          'may be using an out-of-date copy of your keys — share your code '
+          'again to start a fresh session.';
       notifyListeners();
     }
   }

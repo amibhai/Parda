@@ -14,12 +14,13 @@ import '../theme/app_theme.dart';
 /// only from code — there was no way for a human to actually compare
 /// one, which is the entire point of a safety number.
 ///
-/// ## What this screen honestly offers
+/// ## Comparison *and* enforcement
 ///
-/// Comparison, not enforcement. Marking a peer verified here records
-/// nothing that later blocks a substituted key: the Rust `TrustStore`
-/// that performs that check is not wired into this Android client. The
-/// screen says so rather than implying a guarantee it cannot keep.
+/// Confirming here records the peer's current identity key. From then
+/// on a bundle carrying a different key for them — fetched from the
+/// relay or scanned — is refused rather than silently re-pinned, which
+/// is what makes the comparison worth doing. Scanning a contact card in
+/// person achieves the same thing without the manual step.
 class SafetyNumberScreen extends StatefulWidget {
   final String remoteUserId;
 
@@ -32,11 +33,50 @@ class SafetyNumberScreen extends StatefulWidget {
 class _SafetyNumberScreenState extends State<SafetyNumberScreen> {
   String? _digits;
   String? _error;
+  bool _verified = false;
+  bool _busy = false;
 
   @override
   void initState() {
     super.initState();
     _load();
+    _refreshVerified();
+  }
+
+  Future<void> _refreshVerified() async {
+    final verified =
+        await context.read<SessionService>().isVerified(widget.remoteUserId);
+    if (mounted) setState(() => _verified = verified);
+  }
+
+  Future<void> _setVerified(bool value) async {
+    setState(() => _busy = true);
+    final session = context.read<SessionService>();
+    try {
+      if (value) {
+        await session.markVerified(widget.remoteUserId);
+      } else {
+        await session.forgetVerification(widget.remoteUserId);
+      }
+      await _refreshVerified();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(value
+                ? 'Marked verified. A different key for this contact will now be refused.'
+                : 'Verification removed. This contact is back to trust-on-first-use.'),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not update verification: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   Future<void> _load() async {
@@ -98,6 +138,11 @@ class _SafetyNumberScreenState extends State<SafetyNumberScreen> {
               ),
             ],
 
+            if (_digits != null) ...[
+              const SizedBox(height: 20),
+              _verifyControl(),
+            ],
+
             const SizedBox(height: 24),
             _panel(
               icon: Icons.compare_arrows,
@@ -111,11 +156,13 @@ class _SafetyNumberScreenState extends State<SafetyNumberScreen> {
             _panel(
               icon: Icons.warning_amber_outlined,
               color: AppColors.warning,
-              title: 'What this build does not do',
-              body: 'Comparing here is advisory. This client does not store a '
-                  'verified state, so it will not warn you if this contact\'s '
-                  'key changes later. The enforcement mechanism exists in the '
-                  'Rust library but is not wired into the Android app.',
+              title: 'What verifying cannot undo',
+              body: 'If someone was already impersonating this contact when '
+                  'the conversation started, verifying now confirms the '
+                  'impostor\'s key rather than the real one. Verification '
+                  'protects everything after it, never what came before — '
+                  'which is why scanning a code in person at the start is '
+                  'stronger than comparing numbers later.',
             ),
             const SizedBox(height: 12),
             _panel(
@@ -129,6 +176,43 @@ class _SafetyNumberScreenState extends State<SafetyNumberScreen> {
           ],
         ),
       ),
+    );
+  }
+
+  /// The action that turns a comparison into an enforced decision.
+  Widget _verifyControl() {
+    if (_verified) {
+      return Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: AppColors.secure.withValues(alpha: 0.10),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: AppColors.secure.withValues(alpha: 0.4)),
+        ),
+        child: Row(
+          children: [
+            const Icon(Icons.verified_user, color: AppColors.secure, size: 18),
+            const SizedBox(width: 10),
+            const Expanded(
+              child: Text(
+                'Verified. A different key for this contact will be refused.',
+                style: TextStyle(
+                    color: AppColors.secure, fontSize: 12.5, height: 1.4),
+              ),
+            ),
+            TextButton(
+              onPressed: _busy ? null : () => _setVerified(false),
+              style: TextButton.styleFrom(foregroundColor: AppColors.textMuted),
+              child: const Text('Remove', style: TextStyle(fontSize: 12.5)),
+            ),
+          ],
+        ),
+      );
+    }
+    return ElevatedButton.icon(
+      onPressed: _busy ? null : () => _setVerified(true),
+      icon: const Icon(Icons.check_circle_outline, size: 19),
+      label: const Text('These numbers match'),
     );
   }
 

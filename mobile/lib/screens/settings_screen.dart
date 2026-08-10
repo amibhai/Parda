@@ -19,6 +19,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       TextEditingController(text: AppConfig.relayBaseUrl);
   bool _savingRelay = false;
   bool _busyMesh = false;
+  bool _busyHistory = false;
 
   @override
   void dispose() {
@@ -101,6 +102,39 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
               const SizedBox(height: 12),
               _relayStatusLine(session),
+            ],
+          ),
+
+          const SizedBox(height: 22),
+          const _SectionHeader('Message history'),
+          _Card(
+            children: [
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                value: session.historyEnabled,
+                activeThumbColor: AppColors.secure,
+                title: const Text('Keep conversations',
+                    style: TextStyle(fontSize: 14.5)),
+                subtitle: const Text(
+                  'Store messages on this device so they survive closing the '
+                  'app. Encrypted under an Android Keystore key.',
+                  style: TextStyle(fontSize: 12, height: 1.4),
+                ),
+                onChanged: _busyHistory ? null : (v) => _toggleHistory(session, v),
+              ),
+              const Divider(height: 20),
+              const _Caveat(
+                'Turning this off deletes everything already stored, and '
+                'messages then live only until you close the app — including '
+                'ones you have already received.',
+              ),
+              const Divider(height: 20),
+              const _Caveat(
+                'Storing messages is a deliberate trade. Decrypted text on '
+                'disk is recoverable by anyone who defeats the Keystore and '
+                'images the device; keeping it memory-only was stronger, and '
+                'unusable as a messenger.',
+              ),
             ],
           ),
 
@@ -247,6 +281,40 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (problem != null && mounted) _toast(problem);
     } finally {
       if (mounted) setState(() => _busyMesh = false);
+    }
+  }
+
+  Future<void> _toggleHistory(SessionService session, bool value) async {
+    if (!value) {
+      final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Stop keeping conversations?'),
+          content: const Text(
+            'Everything already stored on this device will be deleted, and '
+            'future messages will be lost when you close the app.',
+            style: TextStyle(fontSize: 13.5, height: 1.45),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              style: TextButton.styleFrom(foregroundColor: AppColors.danger),
+              child: const Text('Delete and stop'),
+            ),
+          ],
+        ),
+      );
+      if (confirmed != true) return;
+    }
+    setState(() => _busyHistory = true);
+    try {
+      await session.setHistoryEnabled(value);
+    } finally {
+      if (mounted) setState(() => _busyHistory = false);
     }
   }
 
