@@ -72,5 +72,8 @@ lcov.info
 #     build -p parda-mobile-bridge
 mobile/android/app/src/main/jniLibs/
 
-# Local editor/tooling state
-.claude/
+# A nested clone of this repository was committed by accident as a bare
+# gitlink (no .gitmodules), which left anyone cloning with an empty,
+# unpopulatable `Parda/` directory and made `flutter analyze` from the
+# repo root scan a stale duplicate tree.
+/Parda/
