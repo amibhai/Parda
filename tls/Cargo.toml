@@ -24,9 +24,18 @@ thiserror      = { workspace = true }
 # rather than relying on feature unification staying this way.
 axum-server    = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
 rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-# Self-signed development certificates only — see `dev_certificate`'s
-# docs for why this is never a production path.
-rcgen          = "0.13"
+# Certificate generation: both the throwaway development certificates
+# (`dev_certificate`) and the pinned authority a real deployment uses
+# (`pinned_authority`/`relay_certificate`).
+#
+# `x509-parser` is not a default feature. It is needed for
+# `CertificateParams::from_ca_cert_pem`, which is what lets a relay
+# certificate be reissued from an authority that already exists on disk —
+# the whole operational point of pinning the CA rather than the leaf. A
+# process that could only sign with an authority it had just generated
+# in memory would force a new CA, and therefore a new client build, on
+# every reissue.
+rcgen          = { version = "0.13", features = ["x509-parser"] }
 
 [dev-dependencies]
 reqwest        = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

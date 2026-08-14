@@ -34,6 +34,7 @@
 //! prototype per the brief, is message send/receive over genuine HTTP
 //! via `DirectTransport`.
 
+mod certs;
 mod peer;
 mod stub_relay;
 
@@ -93,6 +94,24 @@ enum Command {
         #[arg(long)]
         import_card: Option<String>,
     },
+
+    /// Generate the pinned certificate authority and the relay
+    /// certificate it signs. See the `certs` module docs for which file
+    /// goes where and why the authority is reused across runs.
+    GenCerts {
+        /// Hostname or IP clients will use to reach the relay. Repeatable;
+        /// the first is also used as the certificate's common name.
+        #[arg(long = "san", required = true)]
+        sans: Vec<String>,
+        /// Where to write the certificates.
+        #[arg(long, default_value = "deploy/certs")]
+        out_dir: std::path::PathBuf,
+        /// Generate a fresh authority instead of reusing one already in
+        /// `--out-dir`. Refuses if that would overwrite an existing
+        /// authority, because doing so locks out every installed client.
+        #[arg(long)]
+        new_authority: bool,
+    },
 }
 
 #[tokio::main]
@@ -110,6 +129,9 @@ async fn main() {
         }
         Command::Peer { relay_url, user_id, echo, import_card } => {
             peer::run(relay_url, user_id, echo, import_card).await;
+        }
+        Command::GenCerts { sans, out_dir, new_authority } => {
+            certs::run(sans, out_dir, new_authority);
         }
     }
 }

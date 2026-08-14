@@ -23,3 +23,8 @@ rand                = "0.8"
 reqwest             = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 base64              = { workspace = true }
 libsignal-protocol  = { git = "https://github.com/signalapp/libsignal", tag = "v0.66.0", package = "libsignal-protocol" }
+# `gen-certs` subcommand: the pinned authority and relay certificate a
+# real deployment serves. Generation lives in parda-tls (where it is
+# tested against a real TLS handshake); this crate only provides the
+# operator-facing command.
+parda-tls           = { path = "../tls" }

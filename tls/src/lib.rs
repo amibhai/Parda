@@ -162,10 +162,180 @@ impl TlsSettings {
 /// honesty boundary `sealed_sender`'s in-process trust root already
 /// draws for itself — a working demo path, explicitly not production
 /// guidance.
+///
+/// The limitation is a property of the *client*, not of self-signing:
+/// see [`pinned_certificate`] for the case where the client holds this
+/// exact certificate as its only trust anchor, which does authenticate
+/// the server and is a supported deployment.
 pub fn dev_certificate(subject_alt_names: &[String]) -> Result<(String, String), TlsError> {
     let cert = rcgen::generate_simple_self_signed(subject_alt_names.to_vec())
         .map_err(|e| TlsError::CertificateGeneration(e.to_string()))?;
     Ok((cert.cert.pem(), cert.key_pair.serialize_pem()))
+}
+
+/// Generate the long-lived certificate authority a PARDA client **pins**,
+/// together with the key that signs relay certificates for it.
+///
+/// Pair with [`relay_certificate`], which issues the certificate the
+/// relay actually serves.
+///
+/// ## Why this is not `dev_certificate` with a longer expiry
+///
+/// [`dev_certificate`]'s warning — that a self-signed certificate stops a
+/// passive eavesdropper but not an active man-in-the-middle, because the
+/// client cannot tell it apart from one the attacker generated — is
+/// precise, and it is a statement about *the client*, not about the
+/// certificate. It holds for a client that accepts any self-signed
+/// certificate. It does not hold for a client that ships this exact
+/// certificate as its **sole** trust anchor for the relay's name, which
+/// is what `mobile/android/app/src/main/res/xml/network_security_config.xml`
+/// configures. That client rejects every other certificate, including a
+/// perfectly valid one from a public CA, so an active man-in-the-middle
+/// needs this private key rather than merely some certificate.
+///
+/// Pinning is therefore a *stronger* authentication property than the
+/// public-CA path, not a weaker one, for two reasons worth stating:
+///
+/// 1. **It removes the CA surface entirely.** A publicly-issued
+///    certificate is trusted because some CA vouched for it, and any of
+///    the ~150 root CAs Android ships can issue for any name. Pinning
+///    reduces that set to one key this project controls.
+/// 2. **It keeps the relay's name out of Certificate Transparency.**
+///    Every publicly-issued certificate is logged to public, append-only
+///    CT logs by design, which makes the hostname enumerable by anyone
+///    scraping them. For a system whose stated goal is metadata
+///    resistance, publishing "this host runs a PARDA relay" to a public
+///    log is a real leak, and it is not one the relay could later retract.
+///
+/// ## Why a two-certificate authority rather than one pinned leaf
+///
+/// The obvious construction is to generate one self-signed certificate,
+/// serve it, and pin it. That does *work*: a self-signed leaf is accepted
+/// as a trust anchor, which was checked rather than assumed and is
+/// asserted by `test_a_self_signed_leaf_is_accepted_as_a_trust_anchor` so
+/// the claim stays honest if the TLS stack's behaviour ever changes. An
+/// earlier draft of this comment asserted the opposite on the theory that
+/// path building requires `basicConstraints: CA:TRUE` on the anchor; the
+/// test disproved it.
+///
+/// The reason to use an authority anyway is operational, and it is
+/// decisive on its own: **pinning the leaf welds the relay's hostname and
+/// key into every installed client.** Moving hosts, adding a second
+/// relay, or rotating a key after a scare would each require shipping a
+/// new APK to every user and having them install it. For a project whose
+/// relay is a free-tier box that can be reclaimed with little warning,
+/// that is a failure that will actually happen, not a theoretical one.
+///
+/// Issuing a leaf from a small CA removes it. The client pins the CA,
+/// which is long-lived and never leaves the operator's machine; the relay
+/// serves a leaf the CA signs, which can be reissued for a new host or a
+/// new key at any time without touching a single installed client. Only
+/// compromise or rotation *of the CA itself* needs an app update.
+///
+/// This is the same trust structure the public CA system uses, with the
+/// set of acceptable roots reduced from ~150 to exactly one that this
+/// project controls.
+pub fn pinned_authority() -> Result<PinnedAuthority, TlsError> {
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
+        .map_err(|e| TlsError::CertificateGeneration(e.to_string()))?;
+
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+        rcgen::KeyUsagePurpose::DigitalSignature,
+    ];
+    params.distinguished_name = {
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::CommonName, "PARDA relay authority");
+        dn
+    };
+    // See `relay_certificate` for why `not_before` sits in the past.
+    params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2045, 1, 1);
+
+    let key_pair =
+        rcgen::KeyPair::generate().map_err(|e| TlsError::CertificateGeneration(e.to_string()))?;
+    let certificate = params
+        .self_signed(&key_pair)
+        .map_err(|e| TlsError::CertificateGeneration(e.to_string()))?;
+
+    Ok(PinnedAuthority { certificate_pem: certificate.pem(), key_pem: key_pair.serialize_pem() })
+}
+
+/// A generated certificate authority: the certificate clients pin, and
+/// the key that signs relay certificates.
+///
+/// The key is the whole security of the arrangement — anyone holding it
+/// can mint a certificate every installed client accepts, and there is no
+/// revocation path short of an app update. It belongs on the operator's
+/// machine, not on the relay host and not in this repository.
+#[derive(Debug, Clone)]
+pub struct PinnedAuthority {
+    /// PEM certificate. Public — this is what ships inside the client.
+    pub certificate_pem: String,
+    /// PEM private key. Secret.
+    pub key_pem: String,
+}
+
+/// Issue a relay certificate from `authority`, PEM-encoded as
+/// `(certificate_chain, private_key)`.
+///
+/// The returned chain is leaf-then-CA, which is what a TLS server must
+/// send: a client pinning only the CA still needs the leaf to chain to
+/// something it recognises, and rustls will not construct that path from
+/// a bare leaf.
+///
+/// ## Validity window
+///
+/// Fixed at 2020-01-01 through 2045-01-01 rather than "now plus N
+/// years". `not_before` sits well in the past deliberately: a device
+/// whose clock is wrong — a freshly flashed phone that has not yet
+/// reached NTP, which is exactly when someone first opens a messaging
+/// app — would otherwise reject a certificate for being newer than it
+/// believes the present to be. Erring in that direction costs nothing
+/// here, because the CA is pinned; a stolen leaf cannot be used against
+/// a client without the CA key that signed it.
+pub fn relay_certificate(
+    authority: &PinnedAuthority,
+    subject_alt_names: &[String],
+) -> Result<(String, String), TlsError> {
+    if subject_alt_names.is_empty() {
+        return Err(TlsError::NoSubjectAltNames);
+    }
+
+    let ca_key = rcgen::KeyPair::from_pem(&authority.key_pem)
+        .map_err(|e| TlsError::CertificateGeneration(format!("authority key: {e}")))?;
+    let ca_params = rcgen::CertificateParams::from_ca_cert_pem(&authority.certificate_pem)
+        .map_err(|e| TlsError::CertificateGeneration(format!("authority certificate: {e}")))?;
+    let ca_cert = ca_params
+        .self_signed(&ca_key)
+        .map_err(|e| TlsError::CertificateGeneration(format!("authority reload: {e}")))?;
+
+    let mut params = rcgen::CertificateParams::new(subject_alt_names.to_vec())
+        .map_err(|e| TlsError::CertificateGeneration(e.to_string()))?;
+    params.use_authority_key_identifier_extension = true;
+    params.key_usages = vec![
+        rcgen::KeyUsagePurpose::DigitalSignature,
+        rcgen::KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2045, 1, 1);
+    params.distinguished_name = {
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::CommonName, subject_alt_names[0].clone());
+        dn
+    };
+
+    let key_pair =
+        rcgen::KeyPair::generate().map_err(|e| TlsError::CertificateGeneration(e.to_string()))?;
+    let leaf = params
+        .signed_by(&key_pair, &ca_cert, &ca_key)
+        .map_err(|e| TlsError::CertificateGeneration(e.to_string()))?;
+
+    let chain = format!("{}{}", leaf.pem(), authority.certificate_pem);
+    Ok((chain, key_pair.serialize_pem()))
 }
 
 /// Serve `app` on `addr`, over TLS if `settings` says so, plaintext
@@ -228,6 +398,12 @@ pub enum TlsError {
 
     #[error("failed to generate a self-signed development certificate: {0}")]
     CertificateGeneration(String),
+
+    #[error(
+        "a pinned certificate needs at least one subject alternative name — the client matches the \
+         relay's host against these, and a certificate naming nothing matches nothing"
+    )]
+    NoSubjectAltNames,
 
     #[error("server error: {0}")]
     Serve(String),
