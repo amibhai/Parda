@@ -17,13 +17,26 @@ class AppConfig {
   static const _meshEnabledKey = 'parda_mesh_enabled';
 
   /// Compile-time default, overridable at build time:
-  ///   flutter run --dart-define=PARDA_RELAY_URL=https://relay.example.com
+  ///   flutter build apk --dart-define=PARDA_RELAY_URL=https://relay.example.com:8443
   ///
   /// `127.0.0.1` is the right default for a *physical device* bridged
   /// with `adb reverse tcp:8080 tcp:8080`, and for desktop. On an
   /// Android emulator the host is `10.0.2.2` instead — the Settings
   /// screen offers both as one-tap presets rather than making the user
   /// know that.
+  ///
+  /// **A relay on any other host must be `https://`.** This is not a
+  /// preference; the app's network security config
+  /// (`android/app/build.gradle.kts`) permits cleartext only to the
+  /// loopback addresses above, so an `http://` URL pointing anywhere else
+  /// fails at connect time. That is why the two defaults here can stay
+  /// `http` — they are the only addresses where it still works, and they
+  /// are addresses no attacker can sit on.
+  ///
+  /// When the build was made with certificate pinning configured, the
+  /// relay must additionally present a certificate issued by the pinned
+  /// authority. A publicly-valid certificate from any CA is refused; see
+  /// `tls/src/lib.rs`'s `pinned_authority`.
   static const String defaultRelayUrl = String.fromEnvironment(
     'PARDA_RELAY_URL',
     defaultValue: 'http://127.0.0.1:8080',

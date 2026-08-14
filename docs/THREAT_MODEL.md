@@ -364,6 +364,68 @@ distinctness, digit formatting, TOFU/Verified transitions). CI job:
 
 ---
 
+### 3.9 Transport-Level Man-in-the-Middle Against the Relay Connection (implemented and tested)
+
+An adversary positioned on the network path between an Android client and
+the relay who can present a TLS certificate of their own — the operator
+of a hostile Wi-Fi network, an ISP, or anyone who can obtain a
+certificate for the relay's hostname from *any* certificate authority the
+device trusts.
+
+**Why the last clause is the whole problem.** Under the ordinary public
+CA model this adversary does not need to break anything. Android ships
+roughly 150 root CAs, any one of which can issue a valid certificate for
+any hostname; a single compromised, coerced, or merely careless CA is
+sufficient. The client has no way to distinguish that certificate from
+the legitimate one, because by construction both are valid.
+
+**What is implemented.** `parda-cli gen-certs` generates a certificate
+authority the operator keeps, and a relay certificate it signs. The
+Android build embeds the authority certificate as the **sole** trust
+anchor for the relay's hostname — `src="@raw/parda_relay_ca"` with no
+`src="system"` alongside it, which is the detail that makes it a
+replacement rather than an addition. A certificate from any other issuer
+is refused regardless of how validly it was issued.
+
+This is the one place in PARDA where the deployed posture is *stronger*
+than the mainstream equivalent rather than weaker, and it is worth being
+precise about why: it is not better cryptography, it is a smaller set of
+trusted keys. It also has a side effect that matters for §3.1 — a
+publicly issued certificate is published to Certificate Transparency logs
+by design, which would make the relay's hostname enumerable by anyone
+scraping them. A pinned private authority is never submitted to CT.
+
+**Boundaries, stated plainly:**
+
+- **Opt-in at build time.** An APK built without `relay.properties` and
+  the authority certificate falls back to the public CA store and is
+  fully exposed to this adversary. Supplying one of the two without the
+  other fails the build rather than shipping a client that appears
+  pinned; supplying neither warns and proceeds.
+- **No revocation.** If the authority key leaks, every installed client
+  accepts the attacker's certificates until each user installs a new
+  APK. Pinning ignores CRL and OCSP deliberately, so there is no faster
+  remedy. The key is correspondingly sensitive — comparable to the
+  release signing key, and it never belongs on the relay host.
+- **Scope is the relay connection only.** This says nothing about the
+  mix path, the mesh transport, or the retrieval leg's IP exposure
+  (§3.1), none of which it touches.
+- **Confidentiality of message *content* never depended on this.**
+  Messages are end-to-end encrypted before transport; a successful
+  transport MITM would see envelope metadata and could tamper with or
+  drop traffic, not read plaintext.
+
+**Tested by:** `tls/tests/tls_integration_tests.rs` test 7, which stands
+up a relay serving a certificate from an attacker-controlled authority —
+valid, unexpired, correctly formed, and issued for exactly the hostname
+the client requests — and asserts the pinned client refuses it. The test
+first confirms that same certificate *is* accepted by a client pinning
+the attacker's authority, so a rejection caused by a malformed
+certificate cannot be mistaken for pinning working. Tests 6 and 8 cover
+the honest path and certificate rotation without a client update.
+
+---
+
 ## 4. Out of Scope (Current Phase)
 
 - **Quantum adversaries:** Post-quantum key encapsulation (ML-KEM) and signatures (ML-DSA) are planned for a future phase. The current design uses X25519 and Ed25519. (`libsignal-protocol`'s Kyber prekey storage trait is implemented as an unused stub — see `protocol/src/store.rs` — solely because the pinned library version requires it structurally; no PQXDH handshake is performed.)
@@ -383,7 +445,7 @@ distinctness, digit formatting, TOFU/Verified transitions). CI job:
 - **Colluding-carrier retrieval-pattern correlation:** §3.7.2's measurement is against a single non-colluding logging carrier; a carrier that colludes with every other carrier a device ever polls through is a strictly stronger adversary not defeated by this phase's mitigation.
 - **Mesh flood/Sybil resistance against an attacker willing to reconnect indefinitely:** raised in cost, not eliminated — see §3.7.1. Building persistent-peer-identity infrastructure to rate-limit by identity was deliberately not done, since that infrastructure would itself be the tracking capability Sub-Phase 4A exists to avoid.
 - **Denial-of-service resilience beyond the gateway edge:** Sub-Phase 4.5E adds a per-client token-bucket limiter to `parda-gateway` only. It is per-process and in-memory, so restarting resets every bucket and multiple instances behind a load balancer do not share state — it bounds casual abuse, not a distributed attacker. `parda-relay` and `parda-mixnode` remain unthrottled; a mix node still rejects malformed Sphinx packets per-packet (fail closed) but nothing limits an adversary who simply sends many well-formed ones.
-- **Transport security by default:** TLS is implemented and tested (`parda-tls`) but opt-in via `PARDA_TLS_ENABLED=1`; the default configuration still speaks plaintext HTTP, loudly warned at startup. With TLS on and no certificate configured, the generated self-signed certificate defeats a passive eavesdropper only, never an active MITM.
+- **Transport security by default:** TLS is implemented and tested (`parda-tls`) but opt-in via `PARDA_TLS_ENABLED=1`; the default *server* configuration still speaks plaintext HTTP, loudly warned at startup. With TLS on and no certificate configured, the generated self-signed certificate defeats a passive eavesdropper only, never an active MITM — unless the client pins its issuer, which is the deployment path §3.9 describes and the Android client supports. The Android client itself is no longer permissive: it refuses cleartext to any non-loopback host regardless of configuration.
 - **Gateway authentication as user authentication:** the API-key mechanism authenticates an API *client*, not a person, and deliberately does not grow into an account system — that would create exactly the metadata concentration point the rest of this design avoids.
 - **On-device power/battery measurement:** `mesh/tests/battery_cost_tests.rs` measures operation counts and wire-byte sizes at this crate's actual parameters, not real milliwatt draw — no BLE hardware exists in the environment this phase was built in to measure that. See README limitations.
 
@@ -448,7 +510,10 @@ Every ✅ row below is backed by a named test a reviewer can run; nothing is mar
 | User-facing fingerprint display | ✅ Implemented — Android safety-number screen | `mobile/lib/screens/safety_number_screen.dart`; 60 digits, verified on a Pixel 8 to match `trust.rs` exactly (`fingerprint_matches_the_android_implementation_known_answer`) |
 | User-facing fingerprint **enforcement** | 🔲 Not implemented — see §3.8 | The Android client stores no verified state and will not warn on a later key change; the screen says so |
 | Combined "expire by T **or** on read" self-destruct mode | ✅ Implemented & tested — Sub-Phase 4.5E | `protocol/tests/self_destruct_tests.rs::test_combined_mode_*` (4 tests, both race orderings) |
-| TLS termination (native rustls) for relay / mix node / gateway | ✅ Implemented & tested — Sub-Phase 4.5E (opt-in; plaintext remains the default — see §4) | `tls/tests/tls_integration_tests.rs` (5/5, incl. a real TLS handshake and a check that plaintext is refused) |
+| TLS termination (native rustls) for relay / mix node / gateway | ✅ Implemented & tested — Sub-Phase 4.5E (opt-in; plaintext remains the default — see §4) | `tls/tests/tls_integration_tests.rs` (10/10, incl. a real TLS handshake and a check that plaintext is refused) |
+| Relay connection authenticated against a pinned CA, not the public CA system (Android) | ✅ Implemented & tested (build-time opt-in; unpinned builds trust the system store — see §3.9) | `tls/tests/tls_integration_tests.rs` test 7 — a valid attacker-issued certificate for the requested hostname is refused, with a control proving the certificate itself is well-formed |
+| Relay certificate rotates without a client update | ✅ Implemented & tested — the client pins the issuing authority, not the leaf | `tls/tests/tls_integration_tests.rs` test 8 |
+| Android client refuses cleartext HTTP off-loopback | ✅ Implemented — generated network security config, confirmed present in a built APK | `mobile/android/app/build.gradle.kts`; verified by inspecting the packaged resources |
 | Gateway API-key authentication + rate limiting | ✅ Implemented & tested — Sub-Phase 4.5E (opt-in; open by default — see §4) | `gateway/tests/auth_rate_limit_tests.rs` (8/8, incl. constant-time prefix rejection and per-key bucket isolation) |
 | Persistent mix-node identity across restarts | ✅ Implemented & tested — Sub-Phase 4.5E | `mixnode/src/identity.rs::tests` (stable across reloads, distinct per path, malformed file refused rather than overwritten) |
 | Post-quantum resistance | 🔲 Future (not in scope v0.x) | Not started |

@@ -9,6 +9,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Relay authentication by pinned certificate authority (Android)
+
+Moving the relay off `adb reverse` and onto a real host raises a question
+this project had not answered: how does the client know it is talking to
+the right relay? The default answer — trust the ~150 root CAs Android
+ships, any of which can issue for any hostname — is weaker than the rest
+of the system, and it publishes the relay's hostname to Certificate
+Transparency logs as a side effect. Neither sits well with a project
+whose stated goal is metadata resistance.
+
+- `parda_tls::pinned_authority` / `relay_certificate` — generate a
+  certificate authority the operator keeps, and relay certificates it
+  signs. Surfaced as `parda-cli gen-certs --san <host>`.
+- The Android build embeds the authority certificate as the **sole**
+  trust anchor for the relay's hostname. The absence of `src="system"`
+  beside it is the entire point: replacing the anchor set rather than
+  adding to it is what makes it a pin instead of a decoration.
+- **The claim is tested, not asserted.**
+  `tls/tests/tls_integration_tests.rs` test 7 stands up a relay serving a
+  certificate from an attacker-controlled authority — valid, unexpired,
+  correctly formed, issued for exactly the hostname requested — and
+  asserts the pinned client refuses it. It first confirms that same
+  certificate *is* accepted by a client pinning the attacker's authority,
+  so a rejection caused by a broken certificate cannot masquerade as
+  pinning working.
+- Cleartext HTTP is now refused to every host except `127.0.0.1`,
+  `10.0.2.2`, and `localhost`. A real behavioural change: an `http://`
+  relay URL that worked over USB fails at connect time once the relay
+  moves anywhere else.
+
+#### An authority rather than a pinned leaf, and why
+
+Pinning the certificate the relay actually serves is simpler, and it
+works — `test_a_self_signed_leaf_is_accepted_as_a_trust_anchor` records
+that measurement, because an earlier draft of the design note claimed the
+opposite (that path building requires `CA:TRUE` on the anchor) and the
+test written to back that claim disproved it. The documentation was
+corrected to match the measurement.
+
+The reason to issue from an authority anyway is operational and
+decisive: a pinned leaf welds the relay's hostname and key into every
+installed client, so moving hosts or rotating a key after a scare would
+require every user to install a new APK. `gen-certs` therefore reuses an
+existing authority across runs and refuses `--new-authority` over one
+that already exists, since regenerating it silently locks out every
+installed client. Test 8 covers the rotation path.
+
+#### Fail-closed configuration
+
+- Supplying `relay.properties` without the authority certificate, or the
+  certificate without `relayHost`, **fails the build**. The dangerous
+  outcome is not a failed build but a successful one that ships an app
+  trusting the public CA store while a certificate sits in `res/raw`
+  making it look pinned. This mirrors `TlsSettings::from_env`'s handling
+  of a cert path without its key.
+- Supplying neither warns and builds unpinned, so a fresh clone and CI
+  still compile without first standing up a relay.
+- `relay.properties` is read as UTF-8 with any BOM stripped. PowerShell's
+  `Set-Content -Encoding utf8` and Notepad both emit one, and
+  `Properties.load` decodes ISO-8859-1, so `relayHost` silently became
+  `﻿relayHost` and pinning turned itself off while the build
+  succeeded. Found by hitting it.
+
+#### Also fixed
+
+- The root `.gitignore`'s `key.properties` rule matched nothing: `#`
+  only opens a comment at the start of a line, so the pattern included
+  its own trailing comment text. Signing credentials were covered by
+  `mobile/android/.gitignore` regardless, which is the only reason
+  nothing leaked.
+
 ### Added / Fixed — Android Client Made Usable (verified on a Pixel 8)
 
 The Android app previously could not work at all: it built and launched,

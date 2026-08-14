@@ -17,8 +17,28 @@ mobile/.dart_tool/
 # Android build
 mobile/android/.gradle/
 mobile/android/app/build/
+# The root Gradle project's own output directory, as distinct from the
+# `app` module's above. Only appears once a build has actually been run,
+# which is why it went unnoticed until one was.
+mobile/android/build/
 mobile/android/local.properties
-mobile/android/key.properties        # signing keystore config — never commit
+# Signing keystore config — never commit.
+#
+# The trailing-comment form this line used to have
+# (`...key.properties        # never commit`) matched nothing: in a
+# .gitignore, `#` only opens a comment at the start of a line, so the
+# pattern silently included the comment text. It was covered anyway by
+# mobile/android/.gitignore, which is the only reason nothing leaked.
+mobile/android/key.properties
+
+# Relay TLS pinning inputs — deployment-specific, see
+# mobile/android/app/build.gradle.kts. The authority *certificate* is
+# public and safe to publish; it is ignored because it names one
+# particular deployment's relay, not because it is secret. The authority
+# *key* that signs it must never be here at all — `parda-cli gen-certs`
+# writes it outside the repository by default.
+mobile/android/relay.properties
+mobile/android/app/src/main/res/raw/parda_relay_ca.pem
 
 # iOS build
 mobile/ios/build/

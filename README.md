@@ -155,6 +155,8 @@ Every ✅ below is backed by a named test — see `docs/THREAT_MODEL.md` §5 for
 | Verification **enforced** on Android: a changed identity key for a verified contact is refused, not re-pinned | ✅ `PersistentSignalStore.identityMatchesVerified`, checked on both the relay-bundle and scanned-card paths |
 | Conversations survive closing the app (encrypted at rest, Keystore master key) | ✅ Verified across a force-stop on device — a real trade against Sub-Phase 4.5C's memory-only posture, see limitations |
 | TLS termination for relay / mix node / gateway (native rustls) | ✅ Sub-Phase 4.5E (opt-in; plaintext remains the default — see limitations) |
+| **Android client authenticates the relay by pinned certificate authority, not the public CA system** | ✅ `tls/tests/tls_integration_tests.rs` test 7 — a man-in-the-middle serving a *valid* certificate for the requested hostname, issued by its own authority, is refused. Build-time opt-in; **unpinned builds fall back to the public CA store**, see limitations |
+| Android client refuses cleartext HTTP to any non-loopback host | ✅ Generated network security config, verified present in a built APK |
 | Gateway API-key authentication + rate limiting | ✅ Sub-Phase 4.5E (opt-in; open by default — see limitations) |
 | Persistent mix-node identity across restarts | ✅ Sub-Phase 4.5E |
 | No persistent radio-layer advertisement identifier (BLE) | ✅ Sub-Phase 4A |
@@ -184,7 +186,9 @@ The following limitations apply and must be understood before any evaluation:
 - **Relay server still sees sender → recipient metadata for any envelope sent with `sealed_sender = false`** — true of every Phase 1 peer, and any Phase 2 peer that doesn't opt in for a given message.
 - **Sealed sender hides identity, not IP address.** The relay still sees the connecting TCP source IP for the *final* mix hop, not the true sender's IP; sealed sender is an application-layer property, not a network-anonymity one on its own.
 - **Sealed-sender certificate issuance has no account authentication behind it** — same Trust-On-First-Use posture Phase 1 already had for prekey bundle uploads. See `docs/THREAT_MODEL.md` §3.5.
-- **TLS exists but is opt-in, so the default configuration still speaks plaintext HTTP.** Sub-Phase 4.5E adds native rustls termination to `parda-relay`, `parda-mixnode`, and `parda-gateway` (`parda-tls`), tested by real handshakes against real listeners (`tls/tests/tls_integration_tests.rs`). It activates only with `PARDA_TLS_ENABLED=1`; without it every request is readable by anyone on the network path. The default was left as-is deliberately — every existing integration test in the workspace connects over `http://` to a real loopback socket, and flipping the default would have made a large untested change while claiming to be a hardening step — and startup logs a warning whenever TLS is off. With TLS on but no certificate configured, a self-signed one is generated: that stops passive eavesdropping only, never an active MITM who can present their own. See `tls/src/lib.rs` module docs.
+- **TLS exists but is opt-in, so the default configuration still speaks plaintext HTTP.** Sub-Phase 4.5E adds native rustls termination to `parda-relay`, `parda-mixnode`, and `parda-gateway` (`parda-tls`), tested by real handshakes against real listeners (`tls/tests/tls_integration_tests.rs`). It activates only with `PARDA_TLS_ENABLED=1`; without it every request is readable by anyone on the network path. The default was left as-is deliberately — every existing integration test in the workspace connects over `http://` to a real loopback socket, and flipping the default would have made a large untested change while claiming to be a hardening step — and startup logs a warning whenever TLS is off. With TLS on but no certificate configured, a self-signed one is generated: against a client that accepts any certificate that stops passive eavesdropping only, never an active MITM who can present their own. That limitation is a property of the client, not of self-signing — a client pinning the issuing authority (`parda-cli gen-certs`, and the row above) does authenticate the server, and that is the supported deployment path. See `tls/src/lib.rs` module docs.
+- **Certificate pinning is a build-time opt-in, and an unpinned build trusts the public CA store.** The Android client authenticates the relay against a single pinned authority when `android/relay.properties` and `res/raw/parda_relay_ca.pem` are both present; the rejection of a man-in-the-middle holding its own authority is proved by `tls/tests/tls_integration_tests.rs` test 7, not asserted. Without those two files — a fresh clone, CI — the build still succeeds and the app falls back to the ~150 root CAs Android ships, any of which can issue for any hostname. Supplying exactly one of the two **fails the build** rather than producing an app that looks configured and is not. Two further bounds are worth stating: pinning protects the relay connection only, so an operator who pins nothing loses nothing else; and a compromised authority key cannot be revoked by any mechanism short of shipping a new APK, because pinning deliberately ignores CRL and OCSP.
+- **The Android client cannot reach a relay over plain HTTP except on loopback.** The generated network security config permits cleartext to `127.0.0.1`, `10.0.2.2`, and `localhost` only — the addresses `adb reverse` and the emulator use, and ones no attacker can position themselves on. Any other relay must be `https://`. This is a real behavioural change: an `http://` URL that worked when tethered by USB fails at connect time once the relay moves to a real host.
 - **Side-channel mitigations are partial.** Constant-time implementations are targeted but not yet verified across all code paths.
 - **Mix-network topology has no directory authority.** `MixTopology` is a static, trust-on-first-use configured list — same posture as prekey bundle upload and sealed-sender cert issuance. No freshness, revocation, or decentralized consensus. See `docs/THREAT_MODEL.md` §3.6, §4.
 - **Mix-network topology has no directory authority, and mix-node key verification is a documented workflow rather than an enforced control.** Sub-Phase 4.5D's `parda_protocol::trust` provides the fingerprint primitive an operator could use to verify a mix node's key out-of-band (`TrustStore` is keyed by an opaque peer ID, tested against a mix-node-shaped identifier in `trust_bootstrapping_tests.rs`), but no mixnode call site invokes it — there is no discovery mechanism and no UI/CLI verification flow. See `docs/phase4.5d-trust-bootstrapping-design.md` §3.
@@ -359,6 +363,62 @@ produces a session the app cannot decrypt; grab a fresh code each time.
 permissions and starts advertising. `adb logcat -s parda` shows the Rust
 side's own log output, and `adb shell dumpsys bluetooth_manager` will
 list `com.parda.app` as an active advertiser once it is running.
+
+### Putting the relay on a real host
+
+Everything above runs over `adb reverse`, which only works while a USB
+cable is attached. To let two people who are not in the same room use the
+app, the relay needs an address both can reach — and the client will
+refuse to talk to it over plain HTTP, because cleartext is permitted only
+to loopback (see limitations).
+
+**1. Generate the certificate authority and the relay's certificate.**
+
+```bash
+cargo run -p parda-cli -- gen-certs --san relay.example.com --out-dir ~/parda-deploy
+```
+
+This writes four files and prints what each is for. Two matter most:
+`authority-key.pem` never leaves your machine — anyone holding it can
+mint a certificate every installed app accepts — and `authority-cert.pem`
+is what the app pins.
+
+Running it again reissues the relay certificate but **keeps the same
+authority**, so already-installed apps keep working across a host move or
+a key rotation. That is the reason the client pins the authority rather
+than the relay's own certificate.
+
+**2. Run the relay with it.**
+
+```bash
+export PARDA_TLS_ENABLED=1
+export PARDA_TLS_CERT_PATH=/path/to/relay-chain.pem
+export PARDA_TLS_KEY_PATH=/path/to/relay-key.pem
+cargo run -p parda-relay
+```
+
+**3. Build the app against it.**
+
+```bash
+cp ~/parda-deploy/authority-cert.pem \
+   mobile/android/app/src/main/res/raw/parda_relay_ca.pem
+echo 'relayHost=relay.example.com' > mobile/android/relay.properties
+
+cd mobile
+flutter build apk --release \
+  --dart-define=PARDA_RELAY_URL=https://relay.example.com:8443
+```
+
+Both files are gitignored, and supplying one without the other fails the
+build rather than producing an APK that looks pinned and is not. Build
+with neither and it still compiles — it just authenticates the relay the
+way an ordinary app does, and says so.
+
+**What this does not solve.** The app receives only while it is open:
+polling is a Dart timer Android suspends with the app, and there is no
+background service or push. Two people can hold a conversation with the
+app in the foreground; messages sent while it is closed wait on the relay
+until it is next opened.
 
 ---
 
