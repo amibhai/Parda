@@ -47,7 +47,7 @@ PARDA is designed to eliminate or mitigate each of these vectors through a combi
 
 ### 🌐 Mix-Network Metadata Resistance
 - Messages routed through a **Sphinx-packet mix network** (Loopix-inspired)
-- Cover traffic generation to prevent traffic analysis
+- Cover traffic generation to prevent traffic analysis (emitted by mix nodes only — clients send none yet; see Status & Limitations)
 - Onion-layered routing with fixed-latency packet batching to defeat timing correlation
 - No relay node learns both the sender and the final recipient
 
@@ -117,6 +117,8 @@ Each phase produces independently testable deliverables. Phases 1–3 target sta
 
 > ⚠️ **RESEARCH PROTOTYPE — NOT FOR OPERATIONAL DEPLOYMENT**
 
+> **A 2026-11-16 review found three problems that make published claims false or are remotely exploitable** — mailbox draining (F1), key replacement (F2), and mix-node replay (F3) — plus seven lesser ones. They are listed first under the limitations below, the table rows they affect are marked, and each has a scheduled fix in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+
 **Current phase: Phase 2 complete (Sub-Phase 2A + Sub-Phase 2B). Phase 3 complete through Sub-Phase 3D: 3A (time-bound self-destruct key derivation + zeroize-on-expiry), 3B (read-triggered destruction), 3C (swap avoidance + forensic-recovery capstone test + mobile audit), and 3D (session-burn, client-side encrypted history store, REST gateway, CLI prototype) all implemented and tested. Phase 4 (Offline Mesh Dead-Drop) complete through Sub-Phase 4D: 4A (BLE proximity transport, one real backend + simulated), 4B (DTN store-and-forward relay agent, flood/Sybil resistance), 4C (blinded dead-drop addressing, measured retrieval-pattern mitigation), and 4D (multi-node simulation at scale, hybrid online/mesh handoff, combined field scenario, battery cost characterization) all implemented and tested — with, honestly, more new limitations surfaced than resolved, the same as Phase 3. **Phase 4.5 (consolidation) is complete** — all five sub-phases: 4.5A (receive-path mix anonymization, closing the gap where the project's own headline claim, "no relay node learns both the sender and the final recipient," was false for the fetch half of every conversation), 4.5B (real Android BLE mesh backend behind a purpose-built Rust↔JNI bridge, built and run on a real emulator), 4.5C (native zeroize-on-release plaintext buffer replacing the unerasable Dart `String`, plus an uncompiled-by-necessity iOS bridge), 4.5D (unified trust bootstrapping — safety-number-style fingerprints replacing three separate undocumented TOFU postures), and 4.5E (operational hardening: TLS, gateway auth and rate limiting, self-destruct restart survival, combined expiry mode, mix-node identity persistence). Phase 4.5 resolved more than it added, unlike Phases 3 and 4 — but three of its five sub-phases still ship with limitations narrower than their goal, each stated explicitly below rather than rounded up.
 
 Every ✅ below is backed by a named test — see `docs/THREAT_MODEL.md` §5 for the exact test each row cites. A property is never marked done on the strength of the implementation alone.
@@ -132,8 +134,9 @@ Every ✅ below is backed by a named test — see `docs/THREAT_MODEL.md` §5 for
 | Relay store encrypted at rest (SQLCipher) | ✅ Sub-Phase 2A |
 | Relay store survives restart | ✅ Sub-Phase 2A |
 | Sender-receiver unlinkability under **network-level traffic timing analysis** (send path) | ✅ Sub-Phase 2B |
-| Mix-network metadata resistance (Sphinx routing, per-hop mixing delay, drop-cover traffic) | ✅ Sub-Phase 2B |
-| Mix routing degrades to loss/delay — never deanonymization — when a hop misbehaves | ✅ Sub-Phase 2B |
+| Mix-network metadata resistance (Sphinx routing, per-hop mixing delay, drop-cover traffic) | ✅ Sub-Phase 2B — **against a passive observer only**: mix nodes do not reject replayed packets (see the replay row) |
+| Mix routing degrades to loss/delay — never deanonymization — when a hop **drops or delays** packets | ✅ Sub-Phase 2B (narrowed from "misbehaves": replay is not covered) |
+| Mix nodes reject replayed Sphinx packets | 🔲 **Not implemented** (found 2026-11-16, F3) — without it an active adversary links an honest hop's input to its output; see limitations |
 | Sender-receiver unlinkability under GPA observation of the **receive/fetch path** | ✅ Sub-Phase 4.5A (mix-routed pull request; retrieval leg's own IP-visibility to the relay is a documented residual, not eliminated — see limitations) |
 | Time-bound self-destruct key derivation (HKDF, local secret — not the Double-Ratchet key, see limitations) | ✅ Sub-Phase 3A |
 | Self-destruct key provably erased from live process memory at expiry | ✅ Sub-Phase 3A |
@@ -175,22 +178,45 @@ Every ✅ below is backed by a named test — see `docs/THREAT_MODEL.md` §5 for
 | Real Wi-Fi Direct platform binding | 🔲 Not implemented — no viable Rust crate found |
 | Decrypted plaintext held in a native zeroize-on-release buffer, not a Dart `String` | ✅ Sub-Phase 4.5C (narrows the window to one render pass; does not eliminate it — see limitations) |
 | Mesh mobile (Flutter) integration | ⚠️ Sub-Phase 4.5B — plugin, JNI bridge, and permissions wired and building; **not driven from the Dart UI**, see limitations |
-| Post-quantum key encapsulation (ML-KEM) | 🔲 Phase 5 |
+| Relay mailbox access requires proof of ownership | 🔲 **Not implemented** (found 2026-11-16, F1) — see limitations |
+| Prekey bundle can be replaced only by its owner | 🔲 **Not implemented** (found 2026-11-16, F2) — upload is last-write-wins |
+| Sealed-sender certificates require proof of key possession | 🔲 **Not implemented** (found 2026-11-16, F4) |
+| Android blocks screenshots/Recents snapshots and keyboard learning on message input | 🔲 **Not implemented** (found 2026-11-16, F5) |
+| Relay keeps serving after a storage error | 🔲 **Not implemented** (found 2026-11-16, F6) |
+| Relay storage bounded per mailbox; relay and mix nodes rate-limited | 🔲 **Not implemented** (found 2026-11-16, F7) |
+| Android client uses the Rust protocol core (sealed sender, mix routing, self-destruct) | 🔲 **Not implemented** (F8) — the app says so in Settings |
+| Client-side cover traffic | 🔲 **Not implemented** (found 2026-11-16, F9) |
+| Post-quantum key encapsulation (ML-KEM) | 🔲 Phase 5 — scheduled as W3 in [`docs/ROADMAP.md`](docs/ROADMAP.md) |
 
 The following limitations apply and must be understood before any evaluation:
+
+**Found in the 2026-11-16 review and not yet fixed.** Each has its evidence and a scheduled fix in [`docs/ROADMAP.md`](docs/ROADMAP.md); threat-model sections are cited per item.
+
+- **Any client that knows a user ID can drain that user's mailbox (F1).** No relay route checks who is calling. `GET /v1/messages/{user_id}` returns and deletes the whole queue, `/v1/pulls` does the same by another route, and IDs are free text typed at onboarding, so common names can be guessed. The relay's CORS policy allows any origin, so any web page that can reach the relay can do it too. Content stays encrypted; delivery and metadata do not survive. See `docs/THREAT_MODEL.md` §3.10.
+- **Prekey upload is last-write-wins, not trust-on-first-use (F2).** Anyone can replace anyone's keys at any time, and every relay-fetched first contact afterwards goes to the replacement. Together with F1, an attacker can read new contacts' messages to any user they can name. Verified contacts and contacts added by QR card are not affected. Two users who choose the same name overwrite each other with no attacker involved. See §3.10.
+- **Mix nodes do not detect replayed packets (F3).** Sphinx processing is deterministic, so a replayed packet leaves an honest node bit-identical and after the same delay, linking its input to its output; repeated hop by hop, this traces a packet's whole path. It needs no compromised node — any sender can submit packets — so the "one honest hop suffices" guarantee currently holds against passive observers only. See §3.2 and §3.6.
+- **Sender certificates are issued without proof of key possession (F4).** The relay certifies any identity key for any user ID, for any caller, so sealed-sender impersonation of unverified contacts needs no compromise. See §3.5.
+- **The Android app sets no `FLAG_SECURE` and lets the keyboard learn message input (F5).** Android may persist Recents thumbnails of open conversations to disk and allows screen capture; the system keyboard may retain typed text. Self-destruct, burn, and switching history off touch neither. See §3.4.
+- **One storage error takes the relay down until restart (F6).** A failed database write panics while holding the database mutex and poisons it; every later request that touches the database then fails, while `/health` keeps reporting `ok`. See §4.
+- **Nothing bounds relay storage per mailbox, and neither the relay nor mix nodes are rate-limited (F7).** Anyone can fill the relay's disk by sending to any recipient. See §4.
+- **The Android app does not use the Rust protocol core (F8).** It runs its own Kotlin stack on libsignal-android 0.52, so sealed sender, mix routing, and self-destruct — implemented and tested in Rust — never reach it; every message it sends goes directly to the relay with `sealed_sender = false`. The app says so in Settings.
+- **Clients emit no cover traffic (F9).** All cover traffic originates at mix nodes, so none of it crosses a client's own link: a global observer sees exactly when a client sends or pulls. Loopix's client-side cover traffic is not implemented. See §3.1 and §3.6.
+- **Transport TLS cannot be made post-quantum with the current provider (F10).** `parda-tls` uses rustls's `ring` provider, which has no ML-KEM.
+
+**Previously documented:**
 
 - **No CNSA 2.0 compliance.** Post-quantum algorithms (ML-KEM, ML-DSA, SLH-DSA) are not yet integrated. The current design uses classical elliptic-curve primitives only.
 - **No FIPS 140-3 validation.** Cryptographic modules have not undergone formal FIPS certification.
 - **No formal security audit.** The codebase has not been independently audited by a third-party cryptographic firm.
 - **Not accredited for classified networks.** PARDA has no ATO (Authority to Operate), does not comply with RMF/DIACAP, and must not be used on any classified infrastructure.
-- **Relay server still sees sender → recipient metadata for any envelope sent with `sealed_sender = false`** — true of every Phase 1 peer, and any Phase 2 peer that doesn't opt in for a given message.
+- **Relay server still sees sender → recipient metadata for any envelope sent with `sealed_sender = false`** — true of every Phase 1 peer, any Phase 2 peer that doesn't opt in for a given message, and every message the Android client sends (F8).
 - **Sealed sender hides identity, not IP address.** The relay still sees the connecting TCP source IP for the *final* mix hop, not the true sender's IP; sealed sender is an application-layer property, not a network-anonymity one on its own.
-- **Sealed-sender certificate issuance has no account authentication behind it** — same Trust-On-First-Use posture Phase 1 already had for prekey bundle uploads. See `docs/THREAT_MODEL.md` §3.5.
+- **Sealed-sender certificate issuance has no account authentication behind it** — the relay certifies whatever identity key any caller presents (F4 above). That is not trust-on-first-use, and neither is prekey upload (F2). See `docs/THREAT_MODEL.md` §3.5 and §3.10.
 - **TLS exists but is opt-in, so the default configuration still speaks plaintext HTTP.** Sub-Phase 4.5E adds native rustls termination to `parda-relay`, `parda-mixnode`, and `parda-gateway` (`parda-tls`), tested by real handshakes against real listeners (`tls/tests/tls_integration_tests.rs`). It activates only with `PARDA_TLS_ENABLED=1`; without it every request is readable by anyone on the network path. The default was left as-is deliberately — every existing integration test in the workspace connects over `http://` to a real loopback socket, and flipping the default would have made a large untested change while claiming to be a hardening step — and startup logs a warning whenever TLS is off. With TLS on but no certificate configured, a self-signed one is generated: against a client that accepts any certificate that stops passive eavesdropping only, never an active MITM who can present their own. That limitation is a property of the client, not of self-signing — a client pinning the issuing authority (`parda-cli gen-certs`, and the row above) does authenticate the server, and that is the supported deployment path. See `tls/src/lib.rs` module docs.
 - **Certificate pinning is a build-time opt-in, and an unpinned build trusts the public CA store.** The Android client authenticates the relay against a single pinned authority when `android/relay.properties` and `res/raw/parda_relay_ca.pem` are both present; the rejection of a man-in-the-middle holding its own authority is proved by `tls/tests/tls_integration_tests.rs` test 7, not asserted. Without those two files — a fresh clone, CI — the build still succeeds and the app falls back to the ~150 root CAs Android ships, any of which can issue for any hostname. Supplying exactly one of the two **fails the build** rather than producing an app that looks configured and is not. Two further bounds are worth stating: pinning protects the relay connection only, so an operator who pins nothing loses nothing else; and a compromised authority key cannot be revoked by any mechanism short of shipping a new APK, because pinning deliberately ignores CRL and OCSP.
 - **The Android client cannot reach a relay over plain HTTP except on loopback.** The generated network security config permits cleartext to `127.0.0.1`, `10.0.2.2`, and `localhost` only — the addresses `adb reverse` and the emulator use, and ones no attacker can position themselves on. Any other relay must be `https://`. This is a real behavioural change: an `http://` URL that worked when tethered by USB fails at connect time once the relay moves to a real host.
 - **Side-channel mitigations are partial.** Constant-time implementations are targeted but not yet verified across all code paths.
-- **Mix-network topology has no directory authority.** `MixTopology` is a static, trust-on-first-use configured list — same posture as prekey bundle upload and sealed-sender cert issuance. No freshness, revocation, or decentralized consensus. See `docs/THREAT_MODEL.md` §3.6, §4.
+- **Mix-network topology has no directory authority.** `MixTopology` is a static, trust-on-first-use configured list (prekey upload and sealed-sender certificate issuance are weaker than that — F2, F4). No freshness, revocation, or decentralized consensus. See `docs/THREAT_MODEL.md` §3.6, §4.
 - **Mix-network topology has no directory authority, and mix-node key verification is a documented workflow rather than an enforced control.** Sub-Phase 4.5D's `parda_protocol::trust` provides the fingerprint primitive an operator could use to verify a mix node's key out-of-band (`TrustStore` is keyed by an opaque peer ID, tested against a mix-node-shaped identifier in `trust_bootstrapping_tests.rs`), but no mixnode call site invokes it — there is no discovery mechanism and no UI/CLI verification flow. See `docs/phase4.5d-trust-bootstrapping-design.md` §3.
 - **Cover traffic requires peer configuration.** A mix node with fewer than 3 configured `MIXNODE_PEERS` emits no cover traffic at all (logged, not silently degraded) — its real-traffic volume alone remains observable to a GPA at that node's edges.
 - **The timing-correlation resistance claim is empirical, not a formal proof.** `mixnode/tests/timing_correlation_tests.rs` demonstrates no above-chance send/arrival correlation via a permutation test at a specific tested scale (path length, node count, delay parameters) — it does not establish anonymity at arbitrary traffic volumes or configurations. See `docs/THREAT_MODEL.md` §3.6.

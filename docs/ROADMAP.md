@@ -379,6 +379,7 @@ These are limits of physics, the platform, or upstream code, not gaps left open:
 
 | Workstream | Status |
 |---|---|
-| W0.2 Record F1–F10 | In progress |
-| W0.1, W0.3–W0.7 | Not started |
+| W0.2 Record F1–F10 | Done — recorded in THREAT_MODEL.md v0.6.0 and the README; nothing fixed yet |
+| W0.1 License | Next |
+| W0.3–W0.7 | Not started |
 | W1–W6 | Not started |

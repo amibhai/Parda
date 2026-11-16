@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added / Security — A roadmap to an audited v1.0, and ten findings recorded (not yet fixed)
+
+A review on 2026-11-16 found problems that no existing document
+recorded, three of which make published claims false or are remotely
+exploitable. Following this project's own rule — say what is true
+before making it better — this entry only records them. Every fix is
+scheduled in `docs/ROADMAP.md` and will land with a test.
+
+- `docs/ROADMAP.md` — the project's first forward-looking plan: seven
+  waves, from documentation and CI foundations (W0) through an external
+  audit (W5) to product work (W6), each closing on claims backed by
+  named tests. It supersedes the bare "Phase 5" row; post-quantum is
+  wave W3.
+- **The relay authorizes nothing (F1, F2, F4).** Any client that knows a
+  user ID can drain that user's mailbox, replace their prekey bundle, or
+  obtain a sender certificate for them, and the relay's CORS policy lets
+  any web page do the same. Prekey upload was described as
+  trust-on-first-use; it is last-write-wins, which is weaker. A new
+  `docs/THREAT_MODEL.md` §3.10 states the adversary, what it gets, and
+  what still holds.
+- **Mix nodes do not reject replayed packets (F3)**, so "one honest hop
+  suffices" holds only against a passive adversary. Two claims are
+  narrowed to what their tests measure: the degradation row now covers
+  hops that drop or delay packets, not "misbehaving" hops in general,
+  and mix-network metadata resistance is marked passive-only. The tests
+  were right; the claims were wider than the tests.
+- **Five hardening gaps (F5–F7, F9, F10).** The Android app sets no
+  `FLAG_SECURE` and lets the keyboard learn message input. One storage
+  error poisons the relay's database mutex until restart, while
+  `/health` keeps reporting `ok`. Relay storage is unbounded, and the
+  relay and mix nodes are unthrottled. Clients emit no cover traffic —
+  the threat model had called this residual "Loopix-inherited", but
+  Loopix clients send cover traffic precisely to hide it. And TLS cannot
+  be made post-quantum on the `ring` provider.
+- **The Android client does not use the Rust protocol core (F8)** —
+  already disclosed in the app's Settings screen, now recorded in the
+  docs and the property table too.
+- F11 (two generations of crypto crates linked at once) and F12 (a
+  three-way license conflict) are engineering and legal items, tracked
+  in the roadmap rather than the threat model.
+- Threat model bumped to v0.6.0.
+
 ### Added — Relay authentication by pinned certificate authority (Android)
 
 Moving the relay off `adb reverse` and onto a real host raises a question
